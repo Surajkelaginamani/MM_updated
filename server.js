@@ -2,25 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const admin = require('firebase-admin');
-const fs = require('fs');
-
 // --- FIREBASE ADMIN SETUP ---
-// On Render: use the secret file at /etc/secrets/firebase-adminsdk.json
-// On local dev: fall back to ./firebase-adminsdk.json
-const RENDER_SECRET_PATH = '/etc/secrets/firebase-adminsdk.json';
-const LOCAL_FALLBACK_PATH = './firebase-adminsdk.json';
-const serviceAccountPath = fs.existsSync(RENDER_SECRET_PATH)
-  ? RENDER_SECRET_PATH
-  : LOCAL_FALLBACK_PATH;
-
-console.log(`🔑 Loading Firebase service account from: ${serviceAccountPath}`);
-const serviceAccount = require(serviceAccountPath);
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
-console.log('Firebase Admin SDK initialized successfully!');
+const admin = require('./config/firebase');
 
 // --- EXPRESS APP SETUP ---
 const app = express();
