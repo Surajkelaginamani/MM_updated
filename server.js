@@ -3,17 +3,24 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const serviceAccount = require('./serviceAccountKey.json');
+const fs = require('fs');
+
 // --- FIREBASE ADMIN SETUP ---
-// Point this to the JSON file you downloaded from Firebase Console
+// On Render: use the secret file at /etc/secrets/firebase-adminsdk.json
+// On local dev: fall back to ./firebase-adminsdk.json
+const RENDER_SECRET_PATH = '/etc/secrets/firebase-adminsdk.json';
+const LOCAL_FALLBACK_PATH = './firebase-adminsdk.json';
+const serviceAccountPath = fs.existsSync(RENDER_SECRET_PATH)
+  ? RENDER_SECRET_PATH
+  : LOCAL_FALLBACK_PATH;
 
-
-
+console.log(`🔑 Loading Firebase service account from: ${serviceAccountPath}`);
+const serviceAccount = require(serviceAccountPath);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
-console.log("Firebase Admin SDK initialized successfully!");
+console.log('Firebase Admin SDK initialized successfully!');
 
 // --- EXPRESS APP SETUP ---
 const app = express();
@@ -76,7 +83,7 @@ app.get('/', (req, res) => {
 
 // --- START SERVER ---
 const PORT = process.env.PORT || 5000;
-app.listen(5000, '0.0.0.0', () => {
-  console.log('Server is running on port 5000');
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server is running on port ${PORT}`);
 });
 

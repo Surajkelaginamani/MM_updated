@@ -5,16 +5,28 @@ const admin = require('firebase-admin');
 exports.updateFcmToken = async (req, res) => {
   try {
     const { token } = req.body;
-    const userId = req.user.id; // Reads the logged-in user from your auth token/middleware
+    // authMiddleware sets req.user.userId — support all variants defensively
+    const userId = req.user.userId || req.user.id || req.user._id;
 
     if (!token) {
       return res.status(400).json({ message: 'Token is required' });
     }
+    if (!userId) {
+      console.error('❌ updateFcmToken: could not resolve userId from req.user:', req.user);
+      return res.status(400).json({ message: 'User identity could not be determined.' });
+    }
 
     // Save the device token to this specific user's record
-    await User.findByIdAndUpdate(userId, { fcmToken: token });
+    const updated = await User.findByIdAndUpdate(userId, { fcmToken: token }, { new: true });
+    if (!updated) {
+      console.error('❌ updateFcmToken: No user found for id:', userId);
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    console.log(`✅ FCM Token saved for user: ${userId}`);
     return res.status(200).json({ message: 'FCM Token updated successfully.' });
   } catch (error) {
+    console.error('❌ Error updating FCM token:', error);
     return res.status(500).json({ message: 'Server error updating token.' });
   }
 };
