@@ -1,0 +1,243 @@
+const User = require('../models/User'); 
+const VendorProfile = require('../models/VendorProfile'); // <-- NEW IMPORT
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+// --- 1. REGISTER A NEW USER OR VENDOR ---
+exports.register = async (req, res) => {
+  try {
+    const { 
+      // Common fields
+      name, email, password, phone, role, 
+      // Customer specific
+      location, roomNumber,
+      // Vendor specific
+      businessName, serviceArea, serviceType, foodType, deliveryType,
+      monthlyFee, halfTiffinMonthlyPrice, singleTiffinPrice 
+    } = req.body;
+
+    // 1. Check if the email is already registered
+    let user = await User.findOne({ email });
+    if (user) {
+      return res.status(400).json({ message: 'User already exists with this email' });
+    }
+
+    // 1.5. Check for admin role restriction
+    if (role === 'admin') {
+      const adminSecret = req.headers['x-admin-secret'];
+      if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) {
+        return res.status(403).json({ message: 'Unauthorized to create admin account' });
+      }
+    }
+
+    // 2. Hash the password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    // 3. Create and save the primary User account
+    user = new User({
+      name,
+      email,
+      password: hashedPassword,
+      phone,
+      role,
+      location: role === 'customer' ? location : undefined, 
+      roomNumber: role === 'customer' ? roomNumber : undefined
+    });
+
+    await user.save(); // Saves to the 'users' collection
+
+    // 4. IF VENDOR: Create and save their connected Business Profile
+    if (role === 'vendor') {
+      const vendorProfile = new VendorProfile({
+        vendorId: user._id, // Links this profile back to the User account
+        businessName,
+        serviceArea,
+        serviceType,
+        foodType,
+        deliveryType,
+        monthlyFee,
+        halfTiffinMonthlyPrice,
+        singleTiffinPrice,
+        status: 'pending' // Set initial status to pending
+      });
+      await vendorProfile.save(); // Saves to the 'vendorprofiles' collection
+    }
+
+    // 5. Create the JWT Token
+    const token = jwt.sign(
+      { userId: user._id, role: user.role }, 
+      process.env.JWT_SECRET, 
+      { expiresIn: '7d' } 
+    );
+
+    // 6. Send Success Response
+    let message = 'Account created successfully';
+    if (role === 'vendor') message = 'Vendor Account created successfully';
+    else if (role === 'customer') message = 'Customer Account created successfully';
+    else if (role === 'admin') message = 'Admin Account created successfully';
+
+    res.status(201).json({
+      message,
+      token,
+      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+    });
+
+  } catch (error) {
+    console.error("Registration Error:", error);
+    res.status(500).json({ message: 'Server error during registration' });
+  }
+};
+
+// --- 2. LOGIN AN EXISTING USER/VENDOR ---
+// (This remains largely the same, as login just checks email/password)
+exports.login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Find user
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    // Verify password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    // Generate Token
+    const token = jwt.sign(
+      { userId: user._id, role: user.role }, 
+      process.env.JWT_SECRET, 
+      { expiresIn: '7d' }
+    );
+
+    res.status(200).json({
+      message: 'Logged in successfully',
+      token,
+      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+    });
+
+  } catch (error) {
+    console.error("Login Error:", error);
+    res.status(500).json({ message: 'Server error during login' });
+  }
+};
+
+// --- 3. CREATE ADMIN (Admin Only) ---
+exports.createAdmin = async (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
+
+    // Check if requester is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Only admins can create admin accounts' });
+    }
+
+    // Check if email already exists
+    let user = await User.findOne({ email });
+    if (user) {
+      return res.status(400).json({ message: 'User already exists with this email' });
+    }
+
+    // Hash password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    // Create admin user
+    user = new User({
+      name,
+      email,
+      password: hashedPassword,
+      phone,
+      role: 'admin'
+    });
+
+    await user.save();
+
+    res.status(201).json({
+      message: 'Admin account created successfully',
+      admin: { id: user._id, name: user.name, email: user.email, role: user.role }
+    });
+
+  } catch (error) {
+    console.error("Create Admin Error:", error);
+    res.status(500).json({ message: 'Server error during admin creation' });
+  }
+};
+
+// --- 4. APPROVE/REJECT VENDOR (Admin Only) ---
+exports.approveVendor = async (req, res) => {
+  try {
+    const { vendorId, action, rejectionReason } = req.body;
+
+    // Check if requester is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Only admins can approve vendors' });
+    }
+
+    const vendorProfile = await VendorProfile.findOne({ vendorId });
+    if (!vendorProfile) {
+      return res.status(404).json({ message: 'Vendor profile not found' });
+    }
+
+    if (action === 'approve') {
+      vendorProfile.status = 'approved';
+      vendorProfile.approvalDate = new Date();
+      vendorProfile.rejectionReason = undefined;
+    } else if (action === 'reject') {
+      vendorProfile.status = 'rejected';
+      vendorProfile.rejectionReason = rejectionReason || 'Application rejected by admin';
+    } else {
+      return res.status(400).json({ message: 'Invalid action. Use "approve" or "reject"' });
+    }
+
+    await vendorProfile.save();
+
+    res.status(200).json({
+      message: `Vendor ${action}d successfully`,
+      vendorProfile: {
+        id: vendorProfile._id,
+        businessName: vendorProfile.businessName,
+        status: vendorProfile.status,
+        approvalDate: vendorProfile.approvalDate,
+        rejectionReason: vendorProfile.rejectionReason
+      }
+    });
+
+// --- 5. GET PENDING VENDORS (Admin Only) ---
+exports.getPendingVendors = async (req, res) => {
+  try {
+    // Check if requester is admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Only admins can view pending vendors' });
+    }
+
+    const pendingVendors = await VendorProfile.find({ status: 'pending' })
+      .populate('vendorId', 'name email phone')
+      .sort({ createdAt: -1 });
+
+    const formattedVendors = pendingVendors.map(vendor => ({
+      id: vendor.vendorId._id,
+      businessName: vendor.businessName,
+      ownerName: vendor.vendorId.name,
+      phone: vendor.vendorId.phone,
+      email: vendor.vendorId.email,
+      location: vendor.serviceArea,
+      foodType: vendor.foodType === 'veg' ? 'Pure Veg' : vendor.foodType === 'nonveg' ? 'Non-Veg' : 'Veg & Non-Veg',
+      appliedDate: vendor.createdAt.toLocaleDateString('en-IN'),
+      status: 'Awaiting Contact'
+    }));
+
+    res.status(200).json({
+      message: 'Pending vendors retrieved successfully',
+      vendors: formattedVendors
+    });
+
+  } catch (error) {
+    console.error("Get Pending Vendors Error:", error);
+    res.status(500).json({ message: 'Server error retrieving pending vendors' });
+  }
+};
