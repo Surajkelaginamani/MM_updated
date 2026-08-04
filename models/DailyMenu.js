@@ -5,6 +5,7 @@ const dailyMenuSchema = new mongoose.Schema({
   
   // The specific date this menu is for
   date: { type: Date, required: true },
+  dateKey: { type: String, required: true, index: true },
   
   // Matching your UI boxes for Lunch and Dinner
   lunch: {
@@ -17,7 +18,7 @@ const dailyMenuSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
-// Ensures a vendor can't accidentally create two different menus for the exact same day
-dailyMenuSchema.index({ vendor: 1, date: 1 }, { unique: true });
+// One published menu per vendor per IST calendar day.
+dailyMenuSchema.index({ vendor: 1, dateKey: 1 }, { unique: true });
 
 module.exports = mongoose.model('DailyMenu', dailyMenuSchema);

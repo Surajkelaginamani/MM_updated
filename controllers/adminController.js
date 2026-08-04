@@ -6,7 +6,6 @@ const admin = require('firebase-admin');
 exports.registerAdmin = async (req, res) => {
   try {
     const { email, password, name, phone } = req.body;
-
     if (!email || !password || !name) {
       return res.status(400).json({ message: 'Email, password, and name are required.' });
     }

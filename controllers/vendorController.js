@@ -9,6 +9,7 @@ const HomemadeStockLog = require('../models/HomemadeStockLog');
 const VendorHoliday = require('../models/VendorHoliday');
 const DeliveryStatus = require('../models/DeliveryStatus');
 const DailyMenu = require('../models/DailyMenu');
+const { normalizeDateKey, getTodayMenuDateInfo, buildTodayMenuQuery, IST_TIME_ZONE } = require('../utils/dailyMenuDateKey');
 const Transaction = require('../models/Transaction');
 // Add this line at the top:
 const { sendPushNotification } = require('./notificationController');
@@ -20,13 +21,6 @@ const parseBoolean = (value, fallback = false) => {
     if (normalized === 'false') return false;
   }
   return fallback;
-};
-
-const normalizeDateKey = (value) => {
-  if (!value) return null;
-  const raw = String(value).trim();
-  const dateKey = raw.includes('T') ? raw.slice(0, 10) : raw;
-  return /^\d{4}-\d{2}-\d{2}$/.test(dateKey) ? dateKey : null;
 };
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
@@ -254,8 +248,18 @@ const ongoingSubscriptions = activeSubscriptions.filter(sub => {
 const uniqueCustomers = await Subscription.distinct('customer', { vendor: vendorProfile._id, status: 'active' });
 const totalCustomers = uniqueCustomers.length;
     const monthlyRevenue = activeSubscriptions.reduce((sum, sub) => sum + sub.price, 0);
-    const todaysMenu = buildTodaysMenuFromWeekly(vendorProfile.weeklyMenu);
-    const todayKey = normalizeDateKey(new Date().toISOString().slice(0, 10));
+    const now = new Date();
+    const dailyMenuDoc = await DailyMenu.findOne(
+      buildTodayMenuQuery(vendorProfile._id, now)
+    ).lean();
+
+    const todaysMenu = dailyMenuDoc
+      ? {
+          ...dailyMenuDoc,
+          day: dailyMenuDoc.day || now.toLocaleDateString('en-US', { weekday: 'long', timeZone: IST_TIME_ZONE }),
+        }
+      : null;
+    const todayKey = normalizeDateKey(new Date());
     const todayHolidayCount = activeSubscriptions.reduce((count, sub) => {
       if (Array.isArray(sub.skippedDates) && sub.skippedDates.some(entry => entry?.date === todayKey)) {
         return count + 1;
@@ -1550,22 +1554,43 @@ exports.updateDailyMenu = async (req, res) => {
 
     const { lunchItems, dinnerItems } = req.body;
 
-    // Get today's date at midnight to search for an existing menu
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const now = new Date();
+    const { dateKey, start: startOfDay, end: endOfDay } = getTodayMenuDateInfo(now);
 
-    // findOneAndUpdate with 'upsert' will update today's menu if it exists, or create a brand new one if it doesn't!
+    console.log('[DailyMenu:publish]', {
+      vendorId: String(vendorProfile._id),
+      serverNow: now.toISOString(),
+      timeZone: IST_TIME_ZONE,
+      dateKey,
+      startOfDay: startOfDay.toISOString(),
+      endOfDay: endOfDay.toISOString(),
+      hasLunch: Boolean(lunchItems),
+      hasDinner: Boolean(dinnerItems),
+    });
+
     const updatedMenu = await DailyMenu.findOneAndUpdate(
-      { vendor: vendorProfile._id, date: { $gte: today } },
-      {
+      buildTodayMenuQuery(vendorProfile._id, now),
+      { $set: {
         vendor: vendorProfile._id,
-        date: new Date(),
-        day: new Date().toLocaleDateString('en-US', { weekday: 'long' }),
+        // Store the stable IST day boundary, not the Render server timestamp.
+        date: startOfDay,
+        dateKey,
+        day: now.toLocaleDateString('en-US', { weekday: 'long', timeZone: IST_TIME_ZONE }),
         lunch: { time: '12:30 PM', items: lunchItems || 'Not updated yet' },
         dinner: { time: '8:00 PM', items: dinnerItems || 'Not updated yet' }
-      },
-      { new: true, upsert: true } 
+      }},
+      { new: true, upsert: true, setDefaultsOnInsert: true }
     );
+
+    // 📋 DIAGNOSTIC LOG — confirm exactly what was saved to MongoDB
+    console.log('VENDOR POSTED MENU:', {
+      menuId: String(updatedMenu._id),
+      vendorId: String(updatedMenu.vendor),
+      dateKey: updatedMenu.dateKey,
+      storedDate: updatedMenu.date.toISOString(),
+      lunch: updatedMenu.lunch,
+      dinner: updatedMenu.dinner,
+    });
 
     res.status(200).json({ message: 'Menu published successfully!', menu: updatedMenu });
 
@@ -1581,8 +1606,7 @@ exports.updateDailyMenu = async (req, res) => {
         { _id: { $in: customerIds }, fcmToken: { $ne: null } },
         { fcmToken: 1 },
       ).lean();
-
-      const vendorName = vendorProfile.businessName ?? 'Your Kitchen';
+    const vendorName = vendorProfile.businessName ?? 'Your Kitchen';
 
       await Promise.allSettled(
         customerUsers.map((u) =>
@@ -1601,6 +1625,39 @@ exports.updateDailyMenu = async (req, res) => {
     res.status(500).json({ message: 'Server error updating menu.' });
   }
 };
+
+// DELETE /api/vendor/menu/today
+exports.deleteDailyMenu = async (req, res) => {
+  try {
+    const vendorProfile = await VendorProfile.findOne({
+      vendorId: req.user.userId || req.user.id,
+    });
+    if (!vendorProfile) {
+      return res.status(404).json({ message: 'Vendor profile not found.' });
+    }
+
+    const now = new Date();
+    const deletedMenu = await DailyMenu.findOneAndDelete(
+      buildTodayMenuQuery(vendorProfile._id, now)
+    );
+
+    if (!deletedMenu) {
+      return res.status(404).json({ message: "No menu found for today to delete." });
+    }
+
+    console.log('VENDOR DELETED MENU:', {
+      menuId: String(deletedMenu._id),
+      vendorId: String(deletedMenu.vendor),
+      dateKey: deletedMenu.dateKey,
+    });
+
+    res.status(200).json({ message: "Today's menu deleted successfully!" });
+  } catch (error) {
+    console.error('Error deleting daily menu:', error);
+    res.status(500).json({ message: 'Server error deleting daily menu' });
+  }
+};
+
 // GET /api/vendor/deliveries/today
 exports.getTodaysDeliveries = async (req, res) => {
   try {
@@ -2263,4 +2320,4 @@ exports.getPollVoters = async (req, res) => {
     console.error('Error fetching poll voters:', error);
     res.status(500).json({ message: 'Server error fetching poll voters' });
   }
-};
+};

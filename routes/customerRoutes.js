@@ -12,7 +12,7 @@ router.post('/register', verifyRegistrationToken, customerController.registerCus
 // --- Profile & Dashboard ---
 router.get('/profile', verifyToken, customerController.getProfile);
 router.put('/profile', verifyToken, customerController.updateProfile);
-router.get('/dashboard', verifyToken, customerController.getDashboardData);
+router.get('/dashboard', verifyToken, customerController.getCustomerDashboard);
 
 // --- Browsing Vendors ---
 router.get('/vendors', verifyToken, customerController.getAllVendors);
@@ -23,6 +23,7 @@ router.get('/subscriptions', verifyToken, customerController.getMySubscriptions)
 router.get('/subscriptions/:id', verifyToken, customerController.getSubscriptionById);
 router.post('/subscribe', verifyToken, customerController.createSubscriptionRequest);
 router.put('/subscriptions/:id/holidays', verifyToken, customerController.updateHolidays);
+router.delete('/subscriptions/:id/withdraw', verifyToken, customerController.withdrawOrCancelPlan);
 
 // --- Menus, Orders, and Payments ---
 router.get('/menus', verifyToken, customerController.getSubscribedWeeklyMenus);

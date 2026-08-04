@@ -59,6 +59,7 @@ router.get('/homemade/logs', verifyToken, vendorController.getVendorHomemadeStoc
 router.get('/subscriptions/pending', verifyToken, vendorController.getPendingRequests);
 router.post('/subscriptions/respond', verifyToken, vendorController.respondToRequest);
 router.post('/menu/today', verifyToken, vendorController.updateDailyMenu);
+router.delete('/menu/today', verifyToken, vendorController.deleteDailyMenu);
 // --- Reviews ---
 router.get('/reviews', verifyToken, vendorController.getVendorReviews);
 router.get('/customers/active', verifyToken, vendorController.getActiveCustomers);

@@ -1,6 +1,8 @@
+const mongoose = require('mongoose');
 const User = require('../models/User');
 const Subscription = require('../models/Subscription');
 const DailyMenu = require('../models/DailyMenu');
+const { normalizeDateKey, getTodayMenuDateInfo, IST_TIME_ZONE } = require('../utils/dailyMenuDateKey');
 const Announcement = require('../models/Announcement');
 
 const VendorHoliday = require('../models/VendorHoliday');
@@ -13,12 +15,6 @@ const Transaction = require('../models/Transaction');
 const VendorProfile = require('../models/VendorProfile');
 const { sendPushNotification } = require('./notificationController');
 
-const normalizeDateKey = (value) => {
-  if (!value) return null;
-  const raw = String(value).trim();
-  const dateKey = raw.includes('T') ? raw.slice(0, 10) : raw;
-  return /^\d{4}-\d{2}-\d{2}$/.test(dateKey) ? dateKey : null;
-};
 
 const parseDateKeyAsLocal = (dateKey) => {
   const [year, month, day] = dateKey.split('-').map(Number);
@@ -128,8 +124,8 @@ exports.getDailyDeliveryList = async (req, res) => {
     const todayDateString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
 
     // Normalize today for date comparisons
-    const todayMidnight = new Date();
-    todayMidnight.setHours(0, 0, 0, 0);
+    const menuDateInfo = getTodayMenuDateInfo();
+    const todayMidnight = menuDateInfo.start;
 
     // 1. Fetch all ACTIVE subscriptions for this vendor
     const allActiveSubs = await Subscription.find({ 
@@ -469,174 +465,182 @@ exports.getSubscriptionById = async (req, res) => {
   }
 };
 
-// In controllers/customerController.js
 exports.getCustomerDashboard = async (req, res) => {
   try {
     const customerId = req.user.userId || req.user.id;
 
-    // Fetch the active subscription
-    const activeSubscription = await Subscription.findOne({ 
-        customer: customerId, // ensure this matches your schema (customer vs customerId)
-        status: 'active' 
-    }).populate('vendor');
+    const menuDateInfo = getTodayMenuDateInfo();
+    const todayMidnight = menuDateInfo.start;
 
-    let vendorAnnouncements = [];
-    let isUnpaid = false;
+    const rawSubscriptions = await Subscription.find({ customer: customerId }).lean();
 
-    if (activeSubscription) {
-      // 1. Fetch announcements
-        const latestAnnouncement = await Announcement.findOne({ 
-          vendor: activeSubscription.vendor._id 
-        }).sort({ createdAt: -1 });
+    const allSubscriptions = await Promise.all(
+      rawSubscriptions.map(async (sub) => {
+        if (!sub.vendor) return sub;
+        const vendorProfile = await VendorProfile.findOne({
+          $or: [{ _id: sub.vendor }, { vendorId: sub.vendor }]
+        }).select('businessName ownerName weeklyMenu vendorId').lean();
 
-      if (latestAnnouncement) {
-        vendorAnnouncements = [{
-          ...latestAnnouncement.toObject(),
-          vendorName: activeSubscription.vendor?.businessName || 'Vendor'
-        }];
-      }
-      
-      // 2. NEW: Check if the vendor marked them as unpaid!
-      // If it's explicitly 'unpaid', or if the field is missing (old data), flag it.
-      if (activeSubscription.paymentStatus === 'unpaid' || !activeSubscription.paymentStatus) {
-        isUnpaid = true;
-      }
-    }
+        return {
+          ...sub,
+          vendor: vendorProfile || null,
+        };
+      })
+    );
 
-    res.status(200).json({
-      user: req.user,
-      subscription: activeSubscription,
-      announcements: vendorAnnouncements,
-      hasPendingBill: isUnpaid, // Send the flag to the frontend!
-      // ... stats, todaysMenu, etc.
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Dashboard fetch failed" });
-  }
-};
-
-exports.getDashboardData = async (req, res) => {
-  try {
-    const customerId = req.user.userId || req.user.id;
-    
-    const todayMidnight = new Date();
-    todayMidnight.setHours(0, 0, 0, 0);
-
-    // 1. Fetch ALL subscriptions for this user first
-    const allSubscriptions = await Subscription.find({ customer: customerId })
-      .populate('vendor', 'businessName ownerName weeklyMenu');
-
-   // 🚨 THE UPGRADE: Make sure the plan has actually started!
-  // 🚨 THE UPGRADE: Make sure the plan has actually started!
-    const activeSubscriptions = allSubscriptions.filter(sub => {
+    const activeSubscriptions = allSubscriptions.filter((sub) => {
       const statusMatch = String(sub.status || '').trim().toLowerCase() === 'active';
-      
-      // 1. Has the end date passed yet?
       const endsInFuture = sub.endDate ? new Date(sub.endDate) >= todayMidnight : true;
-      
-      // 2. HAS THE START DATE ARRIVED YET?
-      // 🚨 THE MIDNIGHT MATH FIX: We must check if it starts BEFORE tomorrow midnight, 
-      // otherwise plans approved today at 2 PM get hidden!
+
       const tomorrowMidnight = new Date(todayMidnight);
       tomorrowMidnight.setDate(tomorrowMidnight.getDate() + 1);
-      
       const startedAlready = sub.startDate ? new Date(sub.startDate) < tomorrowMidnight : true;
-      
+
       return statusMatch && endsInFuture && startedAlready;
     });
 
-    // 3. Calculate Overdue Bills
     const today = new Date();
     let hasPendingBill = false;
-
-    activeSubscriptions.forEach(sub => {
+    activeSubscriptions.forEach((sub) => {
       if (String(sub.paymentStatus || '').trim().toLowerCase() === 'unpaid' && sub.endDate) {
-        const endDate = new Date(sub.endDate);
-        if (today > endDate) {
+        if (today > new Date(sub.endDate)) {
           hasPendingBill = true;
         }
       }
     });
 
-    let todaysMenu = null;
     let announcements = [];
     let weeklyMenus = [];
 
-    // 4. Load Data for the Primary Subscription
     if (activeSubscriptions.length > 0) {
-      const primarySub = activeSubscriptions[0];
+      const vendorNamesMap = {};
+      const activeVendorIds = [];
 
-      if (primarySub.vendor) {
-        todaysMenu = await DailyMenu.findOne({
-          vendor: primarySub.vendor._id,
-          date: { $gte: todayMidnight }
+      activeSubscriptions.forEach((sub) => {
+        if (sub.vendor && sub.vendor._id) {
+          const vIdStr = String(sub.vendor._id);
+          if (!vendorNamesMap[vIdStr]) {
+            activeVendorIds.push(new mongoose.Types.ObjectId(vIdStr));
+            vendorNamesMap[vIdStr] = sub.vendor.businessName || sub.vendor.ownerName || 'Vendor';
+          }
+        }
+      });
+
+      if (activeVendorIds.length > 0) {
+        const rawAnnouncements = await Announcement.find({
+          vendor: { $in: activeVendorIds },
+        })
+          .sort({ createdAt: -1 })
+          .limit(10);
+
+        announcements = rawAnnouncements.map((ann) => {
+          const annObj = ann.toObject();
+          const vIdStr = String(ann.vendor);
+          annObj.vendorName = vendorNamesMap[vIdStr] || 'Vendor';
+          return annObj;
         });
-
-        // Use your fallback logic if DailyMenu isn't set
-        const weeklyMenuFromVendor = primarySub.vendor.weeklyMenu || defaultWeeklyMenu();
-        if (!todaysMenu) {
-          todaysMenu = buildTodaysMenuFromWeekly(weeklyMenuFromVendor);
-        }
-
-        const latestAnnouncement = await Announcement.findOne({
-          vendor: primarySub.vendor._id
-        }).sort({ createdAt: -1 });
-
-        if (latestAnnouncement) {
-          announcements = [{
-            ...latestAnnouncement.toObject(),
-            vendorName: primarySub.vendor.businessName || 'Vendor'
-          }];
-        }
       }
     }
 
-    // 5. Build weekly menus array
     weeklyMenus = activeSubscriptions
       .filter((sub) => sub.vendor)
       .map((sub) => ({
         subscriptionId: sub._id,
         vendorId: sub.vendor._id,
         vendorName: sub.vendor.businessName || 'Vendor',
-        weeklyMenu: sub.vendor.weeklyMenu || defaultWeeklyMenu()
+        weeklyMenu: sub.vendor.weeklyMenu || defaultWeeklyMenu(),
       }));
-// 🚨 THE FIX: Define tomorrow midnight so we don't accidentally fetch today's active plans!
+
+    const subscribedVendors = Array.from(
+      new Map(
+        activeSubscriptions
+          .filter((sub) => sub.vendor && sub.vendor._id)
+          .map((sub) => [String(sub.vendor._id), sub.vendor])
+      ).values()
+    );
+    // 🔧 BUG FIX: Cast to ObjectId so MongoDB $in query matches correctly.
+    // vendor._id from a .lean() result can be a BSON ObjectId or a plain string;
+    // explicitly converting eliminates silent type-mismatch failures.
+    const vendorIds = subscribedVendors.map(
+      (vendor) => new mongoose.Types.ObjectId(String(vendor._id))
+    );
+
+    // 📋 DIAGNOSTIC LOG 1 — verify which vendor IDs we are querying for
+    console.log('[Dashboard:subscribedVendors]', {
+      count: subscribedVendors.length,
+      vendorIds: vendorIds.map(String),
+      dateKey: menuDateInfo.dateKey,
+    });
+
+    const dailyMenus = vendorIds.length
+      ? await DailyMenu.find({
+          vendor: { $in: vendorIds },
+          dateKey: menuDateInfo.dateKey,
+        }).lean()
+      : [];
+
+    // 📋 DIAGNOSTIC LOG 2 — verify what menus MongoDB returned
+    console.log('[Dashboard:fetchedMenus]', {
+      queriedDateKey: menuDateInfo.dateKey,
+      menuCount: dailyMenus.length,
+      menus: dailyMenus.map((m) => ({
+        menuId: String(m._id),
+        vendorId: String(m.vendor),
+        dateKey: m.dateKey,
+        hasLunch: Boolean(m.lunch?.items),
+        hasDinner: Boolean(m.dinner?.items),
+      })),
+    });
+
+    const menusByVendorId = new Map(
+      dailyMenus.map((menu) => [String(menu.vendor), menu])
+    );
+
+    const subscribedMenus = subscribedVendors.map((vendor) => {
+      const menu = menusByVendorId.get(String(vendor._id));
+      return {
+        vendorId: String(vendor._id),
+        businessName: vendor.businessName || vendor.ownerName || 'Kitchen',
+        // If the vendor hasn't posted today, lunch and dinner are null — but
+        // the vendor still appears in the carousel so the student sees them.
+        lunch: menu?.lunch
+          ? { time: menu.lunch.time || '12:30 PM', items: menu.lunch.items || '' }
+          : null,
+        dinner: menu?.dinner
+          ? { time: menu.dinner.time || '8:00 PM', items: menu.dinner.items || '' }
+          : null,
+      };
+    });
+
     const tomorrowMidnightForUpcoming = new Date(todayMidnight);
     tomorrowMidnightForUpcoming.setDate(tomorrowMidnightForUpcoming.getDate() + 1);
 
-    // 🚨 ZERO-TOUCH MULTI-PLAN ENGINE: Grab ALL sleeping future active plans
     const upcomingSubscriptions = await Subscription.find({
       customer: customerId,
       status: 'active',
-      // 🚨 MUST start strictly tomorrow or later!
-      startDate: { $gte: tomorrowMidnightForUpcoming } 
+      startDate: { $gte: tomorrowMidnightForUpcoming },
     }).populate('vendor', 'businessName ownerName weeklyMenu');
 
     const hasUpcomingPlan = upcomingSubscriptions.length > 0;
 
-    // 6. Send it to Flutter
     res.status(200).json({
       user: await User.findById(customerId).select('name email location'),
-      subscriptions: activeSubscriptions, 
+      subscriptions: activeSubscriptions,
       subscription: activeSubscriptions.length > 0 ? activeSubscriptions[0] : null,
-      hasPendingBill: hasPendingBill,
-      
-      hasUpcomingPlan: hasUpcomingPlan,
-      upcomingSubscriptions: upcomingSubscriptions, // <-- Send the clean Array!
-      
-      todaysMenu: todaysMenu || null,
+      hasPendingBill,
+      hasUpcomingPlan,
+      upcomingSubscriptions,
+      subscribedMenus,
       weeklyMenus,
       announcements,
       stats: {
         activeSubscriptions: activeSubscriptions.length + upcomingSubscriptions.length,
-        totalOrders: 0, 
-        monthlySpend: 0
-      }
+        totalOrders: 0,
+        monthlySpend: 0,
+      },
     });
   } catch (error) {
-    console.error("Dashboard Data Error:", error);
+    console.error('Dashboard Data Error:', error);
     res.status(500).json({ message: 'Server error fetching dashboard data' });
   }
 };
@@ -1144,17 +1148,31 @@ exports.createOrUpdateReview = async (req, res) => {
       $or: [{ vendorId: vendorId }, { _id: vendorId }]
     });
 
-    const targetVendorId = vendorProfile ? (vendorProfile.vendorId || vendorProfile._id) : vendorId;
+    // 🔧 FIX: Always use the VendorProfile ObjectId (_id) — this is what the
+    // Review schema's `vendor` field and the unique index { vendor, customer }
+    // are built on. Using vendorProfile.vendorId (a User _id) here was the
+    // source of duplicate-key 500 errors and broken rating recomputation.
+    const targetVendorId = vendorProfile ? vendorProfile._id : vendorId;
 
+    // 🔧 FIX: Query matches either schema fields (vendor/customer) or legacy fields (vendorId/customerId).
+    // Set both field pairs so MongoDB legacy indexes and queries never get null duplicate key errors.
     const review = await Review.findOneAndUpdate(
-      { vendorId: targetVendorId, customerId: customerId },
       {
+        $or: [
+          { vendor: targetVendorId, customer: customerId },
+          { vendorId: targetVendorId, customerId: customerId }
+        ]
+      },
+      {
+        vendor: targetVendorId,
+        customer: customerId,
         vendorId: targetVendorId,
         customerId: customerId,
         rating: parsedRating,
-        comment: reviewComment
+        comment: reviewComment,
+        text: reviewComment,
       },
-      { new: true, upsert: true, setDefaultsOnInsert: true }
+      { returnDocument: 'after', new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
     if (vendorProfile) {
@@ -1176,12 +1194,14 @@ exports.deleteMyReview = async (req, res) => {
     const customerId = req.user.userId || req.user.id;
     const { reviewId } = req.params;
 
-    const review = await Review.findOneAndDelete({ _id: reviewId, customerId: customerId });
+    // 🔧 FIX: Use schema field names (customer, not customerId)
+    const review = await Review.findOneAndDelete({ _id: reviewId, customer: customerId });
     if (!review) {
       return res.status(404).json({ message: 'Review not found.' });
     }
 
-    await recomputeVendorRating(review.vendorId);
+    // 🔧 FIX: Use review.vendor (schema field), not review.vendorId
+    await recomputeVendorRating(review.vendor);
     res.status(200).json({ message: 'Review deleted successfully.' });
   } catch (error) {
     console.error("Error deleting review:", error);
@@ -1354,36 +1374,63 @@ exports.registerCustomer = async (req, res) => {
 // GET /api/customer/announcements
 exports.getKitchenAnnouncements = async (req, res) => {
   try {
-    // 1. Find the student's active subscription to know WHICH kitchen to pull from
-    const activeSub = await Subscription.findOne({ 
-      customer: req.user.userId || req.user.id, 
-      status: 'active' 
-    });
+    const customerId = req.user.userId || req.user.id;
 
-    if (!activeSub) {
-      return res.status(200).json({ announcements: [] }); // If they don't have a kitchen, return empty
+    // 1. Find all active subscriptions for this student to aggregate announcements from all vendors
+    const activeSubscriptions = await Subscription.find({ 
+      customer: customerId, 
+      status: 'active' 
+    }).populate('vendor', 'businessName ownerName');
+
+    if (!activeSubscriptions || activeSubscriptions.length === 0) {
+      return res.status(200).json({ announcements: [], currentUserId: customerId.toString() });
     }
 
-    // 2. Fetch the announcements! 
-    // (We don't even have to check the time, because MongoDB's TTL already deleted the old ones!)
-    const announcements = await Announcement.find({ vendor: activeSub.vendor })
+    // 2. Extract unique vendorIds and build a mapping dictionary for vendorNames
+    const vendorNames = {};
+    const vendorIds = [];
+
+    activeSubscriptions.forEach((sub) => {
+      if (sub.vendor) {
+        const vIdStr = sub.vendor._id ? sub.vendor._id.toString() : sub.vendor.toString();
+        if (!vendorNames[vIdStr]) {
+          vendorIds.push(new mongoose.Types.ObjectId(vIdStr));
+          vendorNames[vIdStr] = sub.vendor.businessName || sub.vendor.ownerName || 'Vendor';
+        }
+      }
+    });
+
+    if (vendorIds.length === 0) {
+      return res.status(200).json({ announcements: [], currentUserId: customerId.toString() });
+    }
+
+    // 3. Fetch announcements from ALL subscribed vendors
+    const rawAnnouncements = await Announcement.find({ vendor: { $in: vendorIds } })
       .sort({ createdAt: -1 });
+
+    // 4. Attach vendorName to each announcement object
+    const announcements = rawAnnouncements.map((ann) => {
+      const annObj = ann.toObject();
+      const vIdStr = ann.vendor ? ann.vendor.toString() : '';
+      annObj.vendorName = vendorNames[vIdStr] || 'Vendor';
+      return annObj;
+    });
 
     // DIAGNOSTIC LOG: Print the first poll's options+voters so we can confirm
     // the voters array reaches the Flutter client and contains the student ID.
-    const firstPoll = announcements.find(a => a.type === 'Poll');
+    const firstPoll = rawAnnouncements.find(a => a.type === 'Poll');
     if (firstPoll) {
       console.log('[POLL DEBUG] options for', firstPoll._id, ':', JSON.stringify(
         firstPoll.options.map(o => ({ text: o.text, votes: o.votes, voters: o.voters }))
       ));
-      console.log('[POLL DEBUG] currentUserId:', req.user.userId || req.user.id);
+      console.log('[POLL DEBUG] currentUserId:', customerId);
     }
 
     res.status(200).json({
       announcements,
       // Include the authenticated student's MongoDB _id so Flutter can check
       // which option they already voted for by matching against voters arrays.
-      currentUserId: (req.user.userId || req.user.id).toString(),
+      currentUserId: customerId.toString(),
     });
 
   } catch (error) {
@@ -1424,17 +1471,24 @@ exports.submitReview = async (req, res) => {
     // Determine the target vendor ID to store in the Review model
     const targetVendorId = vendorProfile._id;
 
-    // 2. Upsert the Review using schema fields (vendor, customer, rating, comment)
+    // 2. Upsert the Review (populating both vendor/customer and vendorId/customerId to avoid null index conflicts)
     const review = await Review.findOneAndUpdate(
-      { vendor: targetVendorId, customer: customerId },
+      {
+        $or: [
+          { vendor: targetVendorId, customer: customerId },
+          { vendorId: targetVendorId, customerId: customerId }
+        ]
+      },
       { 
         vendor: targetVendorId, 
         customer: customerId, 
+        vendorId: targetVendorId, 
+        customerId: customerId, 
         rating: numericRating, 
         comment: reviewComment,
         text: reviewComment
       },
-      { new: true, upsert: true, setDefaultsOnInsert: true }
+      { returnDocument: 'after', new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
     // 3. Recalculate average rating for the kitchen
@@ -1606,5 +1660,54 @@ exports.voteOnPoll = async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server Error while voting' });
+  }
+};
+
+// DELETE /api/customer/subscriptions/:id/withdraw
+// Allows a student to:
+//   * Withdraw a PENDING subscription request (vendor hasn't approved yet)
+//   * Cancel an UPCOMING plan (active status but startDate is strictly in the future)
+exports.withdrawOrCancelPlan = async (req, res) => {
+  try {
+    const customerId = req.user.userId || req.user.id;
+    const { id } = req.params;
+
+    const subscription = await Subscription.findOne({
+      _id: id,
+      customer: customerId,
+    });
+
+    if (!subscription) {
+      return res.status(404).json({ message: 'Subscription not found.' });
+    }
+
+    const status = subscription.status?.toString().trim().toLowerCase();
+    const now = new Date();
+
+    // Case 1: Pending request - vendor hasn't approved yet
+    if (status === 'pending') {
+      await Subscription.findByIdAndDelete(id);
+      return res.status(200).json({
+        message: 'Your subscription request has been withdrawn successfully.',
+      });
+    }
+
+    // Case 2: Active but start date is strictly in the future
+    if (status === 'active' && subscription.startDate && subscription.startDate > now) {
+      subscription.status = 'cancelled';
+      await subscription.save();
+      return res.status(200).json({
+        message: 'Your upcoming plan has been cancelled successfully.',
+      });
+    }
+
+    // Anything else: already started, cannot withdraw
+    return res.status(400).json({
+      message: 'Cannot cancel a plan that has already started. Contact your kitchen directly.',
+    });
+
+  } catch (error) {
+    console.error('withdrawOrCancelPlan error:', error);
+    res.status(500).json({ message: 'Server error processing your request.' });
   }
 };
