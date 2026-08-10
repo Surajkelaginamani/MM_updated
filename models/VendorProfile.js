@@ -30,6 +30,11 @@ const vendorProfileSchema = new mongoose.Schema({
     }
   ],
 
+  // --- ✅ TRIAL TIFFIN PRICE ---
+  // A one-off price for students to try a single tiffin before subscribing.
+  // Set to 0 to hide the trial option from students.
+  trialPrice: { type: Number, default: 0 },
+
   // --- 🚨 THE MASTER HOLIDAY POLICY TOGGLE 🚨 ---
   considersHolidays: { type: Boolean, default: false },
 

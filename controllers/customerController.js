@@ -13,6 +13,7 @@ const HomemadeStockLog = require('../models/HomemadeStockLog');
 const Review = require('../models/Review');
 const Transaction = require('../models/Transaction');
 const VendorProfile = require('../models/VendorProfile');
+const TrialOrder = require('../models/TrialOrder');
 const { sendPushNotification } = require('./notificationController');
 
 
@@ -663,6 +664,7 @@ exports.getAllVendors = async (req, res) => {
         rating: 1,
         totalReviews: 1,
         status: 1,
+        trialPrice: 1,
       }
     );
 
@@ -1629,7 +1631,7 @@ exports.voteOnPoll = async (req, res) => {
 
     const announcement = await Announcement.findById(announcementId);
 
-    if (!announcement || announcement.type !== 'Poll') {
+    if (!announcement || (announcement.type !== 'Poll' && announcement.type !== 'Meal Selection' && announcement.isMealSelection !== true)) {
       return res.status(400).json({ message: 'Invalid poll' });
     }
 
@@ -1709,5 +1711,101 @@ exports.withdrawOrCancelPlan = async (req, res) => {
   } catch (error) {
     console.error('withdrawOrCancelPlan error:', error);
     res.status(500).json({ message: 'Server error processing your request.' });
+  }
+};
+
+// =============================================================================
+// TRIAL TIFFIN (CUSTOMER SIDE)
+// =============================================================================
+
+// POST /customer/book-trial
+exports.bookTrial = async (req, res) => {
+  try {
+    const customerId = req.user.userId || req.user.id;
+    const { vendorId, targetDate, targetSession } = req.body;
+
+    if (!vendorId || !targetDate || !targetSession) {
+      return res.status(400).json({ message: 'vendorId, targetDate and targetSession are required.' });
+    }
+
+    if (!['morning', 'afternoon'].includes(targetSession)) {
+      return res.status(400).json({ message: 'targetSession must be "morning" or "afternoon".' });
+    }
+
+    // Validate date: must be today or future (IST)
+    const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    todayIST.setHours(0, 0, 0, 0);
+    const [y, m, d] = targetDate.split('-').map(Number);
+    const targetDateObj = new Date(y, m - 1, d, 0, 0, 0, 0);
+    if (targetDateObj < todayIST) {
+      return res.status(400).json({ message: 'Target date cannot be in the past.' });
+    }
+
+    const vendor = await VendorProfile.findById(vendorId);
+    if (!vendor) return res.status(404).json({ message: 'Kitchen not found.' });
+    if (vendor.status !== 'approved') {
+      return res.status(400).json({ message: 'This kitchen is not currently accepting orders.' });
+    }
+
+    // Prevent duplicate bookings from same student for same vendor+date+session
+    const existing = await TrialOrder.findOne({
+      customer: customerId,
+      vendor: vendorId,
+      targetDate,
+      targetSession,
+      status: { $ne: 'declined' },
+    });
+    if (existing) {
+      return res.status(409).json({ message: 'You already have a trial booked for this session.' });
+    }
+
+    const trial = await TrialOrder.create({
+      customer: customerId,
+      vendor: vendorId,
+      targetDate,
+      targetSession,
+      price: vendor.trialPrice ?? 0,
+      status: 'pending',
+    });
+
+    // Notify vendor (best-effort)
+    try {
+      const vendorUser = await User.findById(vendor.vendorId, 'fcmToken').lean();
+      if (vendorUser?.fcmToken) {
+        await sendPushNotification(
+          vendorUser.fcmToken,
+          '🥑 New Trial Tiffin Request',
+          `A student wants to try your tiffin on ${targetDate} (${targetSession === 'morning' ? 'Lunch' : 'Dinner'}).`,
+        );
+      }
+    } catch (notifErr) {
+      console.error('Trial booking notification error (non-fatal):', notifErr);
+    }
+
+    res.status(201).json({
+      message: 'Trial tiffin request sent! The kitchen will confirm shortly.',
+      trial,
+    });
+  } catch (error) {
+    console.error('bookTrial error:', error);
+    res.status(500).json({ message: 'Server error booking trial.' });
+  }
+};
+
+// GET /customer/my-trials
+exports.getMyTrials = async (req, res) => {
+  try {
+    const customerId = req.user.userId || req.user.id;
+
+    const trials = await TrialOrder.find({ customer: customerId })
+      .populate('vendor', 'businessName ownerName phone')
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    res.status(200).json(trials);
+  } catch (error) {
+    console.error('getMyTrials error:', error);
+    res.status(500).json({ message: 'Server error fetching your trials.' });
   }
 };

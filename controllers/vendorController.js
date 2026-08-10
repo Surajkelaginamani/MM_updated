@@ -11,7 +11,7 @@ const DeliveryStatus = require('../models/DeliveryStatus');
 const DailyMenu = require('../models/DailyMenu');
 const { normalizeDateKey, getTodayMenuDateInfo, buildTodayMenuQuery, IST_TIME_ZONE } = require('../utils/dailyMenuDateKey');
 const Transaction = require('../models/Transaction');
-// Add this line at the top:
+const TrialOrder = require('../models/TrialOrder');
 const { sendPushNotification } = require('./notificationController');
 const parseBoolean = (value, fallback = false) => {
   if (typeof value === 'boolean') return value;
@@ -202,6 +202,12 @@ exports.getVendorDashboard = async (req, res) => {
       status: 'pending'
     }).populate('customer', 'name email phone'); // Get customer details
 
+    // 2b. Get all pending trial tiffin requests for this vendor
+    const pendingTrials = await TrialOrder.find({
+      vendor: vendorProfile._id,
+      status: 'pending'
+    }).populate('customer', 'name phone location roomNumber');
+
     // 3. Get all active subscriptions for this vendor
     const activeSubscriptions = await Subscription.find({
       vendor: vendorProfile._id,
@@ -270,13 +276,15 @@ const totalCustomers = uniqueCustomers.length;
     res.status(200).json({
       vendorProfile,
       pendingRequests,
+      pendingTrials,
       activeSubscriptions,
       todaysMenu,
       stats: {
         totalCustomers,
         monthlyRevenue,
-     totalSubscriptions: ongoingSubscriptions.length,
-        pendingRequestsCount: pendingRequests.length,
+        totalSubscriptions: ongoingSubscriptions.length,
+        pendingRequestsCount: pendingRequests.length + pendingTrials.length,
+        pendingTrialsCount: pendingTrials.length,
         homemadeOrders: homemadeOrderCount,
         homemadePendingOrders,
         todayHolidayCount
@@ -373,8 +381,10 @@ exports.rejectSubscriptionRequest = async (req, res) => {
       return res.status(403).json({ message: 'Unauthorized: This is not your request' });
     }
 
-    // Update status to 'cancelled'
+    // Reject: zero out the bill so no ghost debt appears in Digital Khata
     subscription.status = 'cancelled';
+    subscription.totalBill = 0;
+    subscription.paymentStatus = 'paid'; // A 0 bill means nothing is owed
     await subscription.save();
 
     res.status(200).json({ message: 'Subscription rejected!', subscription });
@@ -460,10 +470,14 @@ exports.getCommunicationData = async (req, res) => {
     const announcements = await Announcement.find({ vendor: vendorProfile._id })
       .sort({ createdAt: -1 })
       .limit(20);
-    
+
+    // Expose customPlans so the Flutter announcement screen can show real plan names
+    const customPlans = vendorProfile.customPlans || [];
+
     res.status(200).json({
       weeklyMenu: vendorProfile.weeklyMenu,
-      announcements
+      announcements,
+      customPlans
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
@@ -512,7 +526,9 @@ exports.postAnnouncement = async (req, res) => {
       text: String(text).trim(),
     };
 
-    if (type === 'Poll') {
+    // Both 'Poll' and 'Meal Selection' types store voteable options
+    if (type === 'Poll' || type === 'Meal Selection') {
+      const { isMealSelection, targetDateKey, targetSession } = req.body;
       if (!Array.isArray(options)) {
         return res.status(400).json({ message: 'Poll options are required.' });
       }
@@ -540,6 +556,13 @@ exports.postAnnouncement = async (req, res) => {
       }
 
       announcementData.options = optionObjects;
+
+      // For Meal Selection polls, store the date and session metadata
+      if (isMealSelection === true || type === 'Meal Selection') {
+        announcementData.isMealSelection = true;
+        if (targetDateKey) announcementData.targetDateKey = targetDateKey;
+        if (targetSession) announcementData.targetSession = targetSession;
+      }
     }
 
     // 2. Create the document
@@ -633,9 +656,11 @@ exports.getVendorProfileSettings = async (req, res) => {
       foodType: vendorProfile.foodType,
       // ✅ New flexible plans array (includes isActive)
       customPlans: vendorProfile.customPlans || [],
-      considersHolidays: vendorProfile.considersHolidays,
+      vendorConsidersHolidays: vendorProfile.considersHolidays,
       // ✅ Minimum leave days threshold
       minimumHolidayDays: vendorProfile.minimumHolidayDays ?? 1,
+      // ✅ Trial tiffin price
+      trialPrice: vendorProfile.trialPrice ?? 0,
     });
 
   } catch (error) {
@@ -650,8 +675,9 @@ exports.updateVendorProfileSettings = async (req, res) => {
     const { 
       name, phone, businessName, serviceArea, foodType,
       customPlans,          // ✅ New flexible plans array (now includes isActive)
-      considersHolidays,
-      minimumHolidayDays    // ✅ Minimum leave days threshold
+      vendorConsidersHolidays,
+      minimumHolidayDays,   // ✅ Minimum leave days threshold
+      trialPrice            // ✅ Trial tiffin price
     } = req.body;
 
     // 1. Initialize update objects
@@ -671,12 +697,16 @@ exports.updateVendorProfileSettings = async (req, res) => {
     if (businessName !== undefined)    vendorUpdates.businessName    = businessName;
     if (serviceArea !== undefined)     vendorUpdates.serviceArea     = serviceArea;
     if (foodType !== undefined)        vendorUpdates.foodType        = foodType;
-    if (considersHolidays !== undefined) vendorUpdates.considersHolidays = considersHolidays;
+    if (vendorConsidersHolidays !== undefined) vendorUpdates.considersHolidays = vendorConsidersHolidays;
     if (minimumHolidayDays !== undefined && !isNaN(Number(minimumHolidayDays))) {
       vendorUpdates.minimumHolidayDays = Math.max(1, Number(minimumHolidayDays));
     }
     // ✅ Replace entire plans array atomically (preserves isActive flag from client)
     if (Array.isArray(customPlans))    vendorUpdates.customPlans     = customPlans;
+    // ✅ Trial tiffin price
+    if (trialPrice !== undefined && !isNaN(Number(trialPrice))) {
+      vendorUpdates.trialPrice = Math.max(0, Number(trialPrice));
+    }
 
     const updatedProfile = await VendorProfile.findOneAndUpdate(
       { vendorId: userId },
@@ -1441,7 +1471,28 @@ exports.getPendingRequests = async (req, res) => {
       $or: [{ status: 'pending' }, { status: { $exists: false } }]
     }).populate('customer', 'name phone location roomNumber'); // Pulls student info automatically
 
-    res.status(200).json(pendingRequests);
+    // 3. Fetch all pending TrialOrders for this vendor
+    const pendingTrials = await TrialOrder.find({
+      vendor: vendorProfile._id,
+      status: 'pending'
+    }).populate('customer', 'name phone location roomNumber');
+
+    const formattedTrials = pendingTrials.map(t => ({
+      _id: t._id,
+      customer: t.customer,
+      planType: 'Trial Tiffin',
+      planName: '1-Day Trial Tiffin',
+      preferredSession: t.targetSession,
+      targetDate: t.targetDate,
+      price: t.price,
+      isTrialOrder: true,
+      createdAt: t.createdAt
+    }));
+
+    const combined = [...pendingRequests.map(r => r.toObject()), ...formattedTrials];
+    combined.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    res.status(200).json(combined);
   } catch (error) {
     console.error("Error fetching pending requests:", error);
     res.status(500).json({ message: 'Server error fetching requests.' });
@@ -1495,6 +1546,10 @@ exports.respondToRequest = async (req, res) => {
 
       update.startDate = approvalDate;
       update.endDate   = approvalEndDate;
+    } else {
+      // Rejected: zero out the bill so no ghost debt appears in Digital Khata
+      update.totalBill = 0;
+      update.paymentStatus = 'paid'; // A 0 bill means nothing is owed
     }
 
     const updatedSubscription = await Subscription.findOneAndUpdate(
@@ -1668,8 +1723,8 @@ exports.getTodaysDeliveries = async (req, res) => {
     const today = new Date();
     today.setHours(today.getHours() + 5);
     today.setMinutes(today.getMinutes() + 30);
-    const todayString = today.toISOString().split('T')[0]; 
-    
+    const todayString = today.toISOString().split('T')[0];
+
     // Create a strict midnight timestamp for calendar math
     const todayStart = new Date(todayString);
     todayStart.setHours(0, 0, 0, 0);
@@ -1678,7 +1733,7 @@ exports.getTodaysDeliveries = async (req, res) => {
     const activeSubscriptions = await Subscription.find({
       vendor: vendorProfile._id,
       status: 'active',
-      endDate: { $gte: todayStart } 
+      endDate: { $gte: todayStart }
     }).populate('customer', 'name phone location roomNumber');
 
     // 🚨 2. THE NEW TIME-AWARE FILTER 🚨
@@ -1707,26 +1762,68 @@ exports.getTodaysDeliveries = async (req, res) => {
       if (record.session === 'afternoon') deliveredAfternoonIds.add(record.subscription.toString());
     });
 
+    // 🍽️ 3b. Fetch today's Meal Selection polls to override per-student mealType
+    // morningVotes / afternoonVotes: { customerId(string) -> 'veg' | 'non-veg' }
+    const morningVotes = {};
+    const afternoonVotes = {};
+
+    try {
+      const todayPolls = await Announcement.find({
+        vendor: vendorProfile._id,
+        type: 'Meal Selection',
+        targetDateKey: todayString
+      }).lean();
+
+      for (const poll of todayPolls) {
+        const session = (poll.targetSession || 'morning').toLowerCase();
+        const targetVotes = session === 'afternoon' ? afternoonVotes : morningVotes;
+
+        if (Array.isArray(poll.options)) {
+          for (const option of poll.options) {
+            // Normalize option text: 'Non-Veg' → 'non-veg', 'Veg' → 'veg'
+            const normalizedText = (option.text || '').trim().toLowerCase();
+            const isNonVeg = normalizedText.includes('non');
+            const mealLabel = isNonVeg ? 'non-veg' : 'veg';
+
+            if (Array.isArray(option.voters)) {
+              for (const voterId of option.voters) {
+                targetVotes[voterId.toString()] = mealLabel;
+              }
+            }
+          }
+        }
+      }
+    } catch (pollErr) {
+      // Non-fatal: if poll fetch fails, fall back to subscription mealType
+      console.error('Meal Selection poll fetch error (non-fatal):', pollErr);
+    }
+
     let morningPending = [];
     let afternoonPending = [];
     let morningDelivered = [];
     let afternoonDelivered = [];
-    let studentsOnLeaveToday = []; 
+    let studentsOnLeaveToday = [];
 
     // 🚨 4. Sort ONLY the Valid Deliveries into Lunch, Dinner, or Holiday
     validDeliveries.forEach(sub => {
-      if (!sub.customer) return; 
+      if (!sub.customer) return;
 
       const todayHoliday = sub.skippedDates?.find(d => d.date === todayString);
-      const skippedTime = todayHoliday ? todayHoliday.time : null; 
-      const studentData = {
+      const skippedTime = todayHoliday ? todayHoliday.time : null;
+
+      const customerId = sub.customer._id.toString();
+
+      // Apply poll vote → override sub.mealType if the student voted today
+      const morningMealType = morningVotes[customerId] || (sub.mealType || 'veg').toLowerCase();
+      const afternoonMealType = afternoonVotes[customerId] || (sub.mealType || 'veg').toLowerCase();
+
+      const baseStudentData = {
         subscriptionId: sub._id,
         customerName: sub.customer.name || 'Unknown Student',
         roomNumber: sub.customer.roomNumber || 'N/A',
-        location: sub.customer.location || 'Main Hostel', 
+        location: sub.customer.location || 'Main Hostel',
         phone: sub.customer.phone || '',
-        mealType: sub.mealType || 'veg',
-        
+
         // 🚨 THE FIX: Add the Trial Flags for the Vendor UI!
         planType: sub.planType,
         isTrial: sub.planType === 'single',
@@ -1736,10 +1833,11 @@ exports.getTodaysDeliveries = async (req, res) => {
 
       const subId = sub._id.toString();
 
-      // Track if they are on leave today
+      // Track if they are on leave today (use subscription default mealType for leave record)
       if (skippedTime) {
         studentsOnLeaveToday.push({
-          ...studentData,
+          ...baseStudentData,
+          mealType: (sub.mealType || 'veg').toLowerCase(),
           leaveType: skippedTime // 'morning', 'afternoon', or 'full_day'
         });
       }
@@ -1747,26 +1845,28 @@ exports.getTodaysDeliveries = async (req, res) => {
       // Instead of bundleType, we strictly look at their preferredSession
       let allowedSessions = [];
       if (sub.preferredSession === 'both') {
-         allowedSessions = ['morning', 'afternoon'];
+        allowedSessions = ['morning', 'afternoon'];
       } else {
-         allowedSessions = [sub.preferredSession || 'morning'];
+        allowedSessions = [sub.preferredSession || 'morning'];
       }
 
-      // 12:30 PM (LUNCH) SORTING
+      // 12:30 PM (LUNCH) SORTING — use morning poll vote for mealType
       if (allowedSessions.includes('morning') && skippedTime !== 'morning' && skippedTime !== 'full_day') {
+        const morningStudentData = { ...baseStudentData, mealType: morningMealType, mealSlot: 'morning' };
         if (deliveredMorningIds.has(subId)) {
-          morningDelivered.push({ ...studentData, mealSlot: 'morning' });
+          morningDelivered.push(morningStudentData);
         } else {
-          morningPending.push({ ...studentData, mealSlot: 'morning' });
+          morningPending.push(morningStudentData);
         }
       }
 
-      // 8:00 PM (DINNER) SORTING
+      // 8:00 PM (DINNER) SORTING — use afternoon poll vote for mealType
       if (allowedSessions.includes('afternoon') && skippedTime !== 'afternoon' && skippedTime !== 'full_day') {
+        const afternoonStudentData = { ...baseStudentData, mealType: afternoonMealType, mealSlot: 'afternoon' };
         if (deliveredAfternoonIds.has(subId)) {
-          afternoonDelivered.push({ ...studentData, mealSlot: 'afternoon' });
+          afternoonDelivered.push(afternoonStudentData);
         } else {
-          afternoonPending.push({ ...studentData, mealSlot: 'afternoon' });
+          afternoonPending.push(afternoonStudentData);
         }
       }
     });
@@ -1774,18 +1874,41 @@ exports.getTodaysDeliveries = async (req, res) => {
     // Helper to group by hostel
     const groupStudentsByLocation = (studentsArray) => {
       return studentsArray.reduce((acc, student) => {
-        const loc = student.location; 
+        const loc = student.location;
         if (!acc[loc]) acc[loc] = [];
         acc[loc].push(student);
         return acc;
       }, {});
     };
 
+    // 🥑 6. Fetch accepted Trial Orders for today (shown as Express Dispatch)
+    let extraOrders = [];
+    try {
+      const todayTrials = await TrialOrder.find({
+        vendor: vendorProfile._id,
+        targetDate: todayString,
+        status: 'accepted',
+      }).populate('customer', 'name phone location roomNumber');
+
+      extraOrders = todayTrials.map((t) => ({
+        trialOrderId: t._id,
+        customerName: t.customer?.name || 'Unknown',
+        phone: t.customer?.phone || '',
+        location: t.customer?.location || 'N/A',
+        roomNumber: t.customer?.roomNumber || '',
+        targetSession: t.targetSession,
+        price: t.price,
+        isTrial: true,
+      }));
+    } catch (trialErr) {
+      console.error('Trial order fetch error (non-fatal):', trialErr);
+    }
+
     // 5. Send the final cleaned data to your Flutter App
     res.status(200).json({
       totalDeliveries: morningPending.length + afternoonPending.length,
       currentSession: new Date().getHours() < 15 ? 'morning' : 'afternoon',
-      todaysLeavesList: studentsOnLeaveToday, 
+      todaysLeavesList: studentsOnLeaveToday,
       sessions: {
         morning: {
           totalDeliveries: morningPending.length,
@@ -1800,8 +1923,9 @@ exports.getTodaysDeliveries = async (req, res) => {
         morning: { totalDeliveries: morningDelivered.length, groupedList: groupStudentsByLocation(morningDelivered) },
         afternoon: { totalDeliveries: afternoonDelivered.length, groupedList: groupStudentsByLocation(afternoonDelivered) }
       },
-      isVendorHoliday: false, 
-      holidayReason: ''
+      isVendorHoliday: false,
+      holidayReason: '',
+      extraOrders
     });
 
   } catch (error) {
@@ -2055,90 +2179,122 @@ exports.cancelSubscription = async (req, res) => {
     const userId = req.user.userId || req.user.id;
     const subId = req.params.id;
 
-    // Resolve the canonical vendor profile (subscriptions reference VendorProfile _id)
     const vendorProfile = await VendorProfile.findOne({ vendorId: userId });
     if (!vendorProfile) return res.status(404).json({ message: 'Vendor profile not found.' });
 
     const sub = await Subscription.findOne({ _id: subId, vendor: vendorProfile._id });
     if (!sub) return res.status(404).json({ message: 'Subscription not found for this vendor.' });
-    
+
     if (sub.status === 'cancelled' || sub.status === 'completed') {
       return res.status(400).json({ message: 'This plan is already closed.' });
     }
 
-    const today = new Date();
-    // Start measuring from the actual startDate
-    const startDate = new Date(sub.startDate || sub.createdAt); 
+    // If still pending (never activated), treat like a rejection — zero the bill
+    if (sub.status === 'pending') {
+      sub.status = 'cancelled';
+      sub.totalBill = 0;
+      sub.paymentStatus = 'paid'; // A 0 bill means nothing is owed
+      await sub.save();
+      return res.status(200).json({ message: 'Pending plan cancelled. No charge applied.', newTotal: 0 });
+    }
 
-    // 1. Calculate Calendar Days Elapsed
-    const diffTime = today.getTime() - startDate.getTime();
-    let calendarDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-    if (calendarDays <= 0) calendarDays = 1;
+    // 1. DETERMINE PLAN DETAILS (Duration, Meals/Day, Price)
+    const originalPrice = Number(sub.totalBill) || 0;
+    const planStr = String(sub.planType || '').toLowerCase().trim();
+    const originalSession = String(sub.preferredSession || '').toLowerCase().trim();
 
-    // 2. Calculate EXACT skipped days (Respecting Half-Days & Past Dates only)
-    const planStr = String(sub.planType || '').toLowerCase();
-    
-    // Check how many meals they get per day (Full = 2, Half = 1)
-    const mealsPerDay = planStr.includes('full') || planStr === 'weekly' ? 2 : 1;
-    let totalSkippedDays = 0;
+    let baseDuration = 30;
+    let mealsPerDay = (planStr.includes('full') || planStr.includes('2') || originalSession === 'both') ? 2 : 1;
 
-    if (Array.isArray(sub.skippedDates)) {
-      sub.skippedDates.forEach(entry => {
-        if (!entry || !entry.date) return;
-        
-        // Parse the "YYYY-MM-DD" date safely
-        const [year, month, day] = entry.date.split('-').map(Number);
-        const targetDate = new Date(year, month - 1, day, 0, 0, 0, 0);
-        
-        // ONLY count holidays if they occurred today or in the past
-        if (targetDate.getTime() <= today.getTime()) {
-          const time = entry.time || 'full_day';
-          
-          if (time === 'full_day') {
-            totalSkippedDays += 1;
-          } else {
-            // If they skipped lunch/dinner, subtract a fraction of a day based on their plan
-            totalSkippedDays += (1 / mealsPerDay); 
+    // Fetch from Custom Plans if available
+    if (vendorProfile.customPlans && Array.isArray(vendorProfile.customPlans)) {
+      const matchedPlan = vendorProfile.customPlans.find(p =>
+        String(p.planName || '').toLowerCase().trim() === planStr ||
+        String(p.planName || '').toLowerCase().replace(/\s+/g, '_') === planStr
+      );
+
+      if (matchedPlan) {
+        if (matchedPlan.durationDays) baseDuration = Number(matchedPlan.durationDays);
+        if (matchedPlan.mealsPerDay) mealsPerDay = Number(matchedPlan.mealsPerDay);
+      } else if (sub.startDate && sub.endDate) {
+        // Fallback: Calculate intended duration using original dates
+        const sDate = new Date(sub.startDate).setHours(0, 0, 0, 0);
+        const eDate = new Date(sub.endDate).setHours(0, 0, 0, 0);
+        const diffDays = Math.round((eDate - sDate) / (1000 * 60 * 60 * 24)) + 1;
+        if (diffDays > 0) baseDuration = diffDays;
+      }
+    }
+
+    // 2. PER-TIFFIN MATH
+    const totalTiffinsInPlan = baseDuration * mealsPerDay;
+    const pricePerTiffin = originalPrice / totalTiffinsInPlan;
+
+    // 3. EFFECTIVE CANCEL DATE
+    let effectiveCancelDate = new Date();
+    if (sub.status === 'paused' && sub.pausedAt) {
+      effectiveCancelDate = new Date(sub.pausedAt); // Stop the clock when it was paused
+    }
+    effectiveCancelDate.setHours(0, 0, 0, 0);
+
+    const startDate = new Date(sub.startDate || sub.createdAt);
+    startDate.setHours(0, 0, 0, 0);
+
+    let tiffinsEaten = 0;
+
+    if (effectiveCancelDate >= startDate) {
+      const calendarDays = Math.round((effectiveCancelDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+      const expectedTiffins = calendarDays * mealsPerDay;
+
+      let skippedTiffins = 0;
+      if (Array.isArray(sub.skippedDates)) {
+        sub.skippedDates.forEach(entry => {
+          if (!entry || !entry.date) return;
+          // Safely parse date regardless of timezone
+          const [y, m, d] = entry.date.split('-').map(Number);
+          const targetDate = new Date(y, m - 1, d, 0, 0, 0, 0);
+
+          // Only count leaves taken up to the cancellation date
+          if (targetDate.getTime() <= effectiveCancelDate.getTime()) {
+            const timeVal = entry.time || 'full_day';
+            if (timeVal === 'full_day') {
+              skippedTiffins += mealsPerDay; // Skips all meals for that day
+            } else {
+              skippedTiffins += 1; // Skips just 1 meal
+            }
           }
-        }
-      });
+        });
+      }
+
+      tiffinsEaten = expectedTiffins - skippedTiffins;
+      if (tiffinsEaten < 0) tiffinsEaten = 0;
     }
 
-    // 3. Final Billable Days
-    let billableDays = calendarDays - totalSkippedDays;
-    if (billableDays < 0) billableDays = 0;
+    // Cap tiffins eaten to max plan tiffins to avoid overcharging
+    if (tiffinsEaten > totalTiffinsInPlan) tiffinsEaten = totalTiffinsInPlan;
 
-    // 4. Calculate Daily Rate
-    let dailyRate = 0;
-    if (planStr.includes('monthly')) {
-      dailyRate = sub.totalBill / 30;
-    } else if (planStr === 'weekly') {
-      dailyRate = sub.totalBill / 7;
-    } else if (planStr === '15_days') {
-      dailyRate = sub.totalBill / 15;
-    } else {
-      dailyRate = sub.totalBill; // single meal
-    }
+    // 4. FINAL BILL
+    let finalBill = Math.round(tiffinsEaten * pricePerTiffin);
+    if (finalBill > originalPrice) finalBill = originalPrice;
 
-    // 5. Calculate New Total Bill
-    let newTotalBill = Math.ceil(billableDays * dailyRate);
-    if (newTotalBill > sub.totalBill) newTotalBill = sub.totalBill; // Safety net
-
-    // 6. Update and Save
-    sub.totalBill = newTotalBill;
+    // 5. UPDATE AND SAVE
+    sub.totalBill = finalBill;
     sub.status = 'cancelled';
-    sub.endDate = today; // Officially ends today
+    sub.endDate = effectiveCancelDate;
 
-    // Check if their previous partial payments completely cover this new smaller bill
-    if (sub.amountPaid >= sub.totalBill) {
+    const amountPaid = Number(sub.amountPaid) || 0;
+    if (amountPaid >= finalBill) {
       sub.paymentStatus = 'paid';
+    } else if (amountPaid > 0) {
+      sub.paymentStatus = 'partial';
+    } else {
+      sub.paymentStatus = 'unpaid';
     }
 
     await sub.save();
 
-    res.status(200).json({ 
-      message: `Plan cancelled. Billed for ${billableDays} actual days (₹${newTotalBill}).`,
-      newTotal: newTotalBill 
+    res.status(200).json({
+      message: `Plan cancelled. Billed for ${tiffinsEaten} tiffins: ₹${finalBill}`,
+      newTotal: finalBill
     });
 
   } catch (error) {
@@ -2285,39 +2441,90 @@ exports.togglePollLock = async (req, res) => {
 exports.getPollVoters = async (req, res) => {
   try {
     const { id, optionIndex } = req.params;
-    const idx = parseInt(optionIndex, 10);
+    
+    // Populate the voters with name, roomNumber, location, and phone
+    const announcement = await Announcement.findById(id).populate('options.voters', 'name roomNumber location phone');
+    if (!announcement) {
+      return res.status(404).json({ message: 'Announcement not found.' });
+    }
+
+    // Explicitly allow BOTH standard Polls and Meal Selection polls
+    if (announcement.type !== 'Poll' && announcement.type !== 'Meal Selection' && announcement.isMealSelection !== true) {
+      return res.status(400).json({ message: 'Not a poll type that supports voters.' });
+    }
+
+    const option = announcement.options[optionIndex];
+    if (!option) {
+      return res.status(404).json({ message: 'Option not found.' });
+    }
+
+    res.status(200).json(option.voters);
+  } catch (error) {
+    console.error('Error fetching poll voters:', error);
+    res.status(500).json({ message: 'Server error fetching voters.' });
+  }
+};
+
+// =============================================================================
+// TRIAL TIFFIN MANAGEMENT (VENDOR SIDE)
+// =============================================================================
+
+// GET /vendor/trials — list pending trial orders for the authenticated vendor
+exports.getTrialOrders = async (req, res) => {
+  try {
+    const vendorProfile = await VendorProfile.findOne({ vendorId: req.user.userId || req.user.id });
+    if (!vendorProfile) return res.status(404).json({ message: 'Vendor not found' });
+
+    const trials = await TrialOrder.find({ vendor: vendorProfile._id })
+      .populate('customer', 'name phone location roomNumber')
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    res.status(200).json(trials);
+  } catch (error) {
+    console.error('Error fetching trial orders:', error);
+    res.status(500).json({ message: 'Server error fetching trial orders.' });
+  }
+};
+
+// PUT /vendor/trials/:id/respond — accept or decline a trial order
+exports.respondToTrialOrder = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action } = req.body; // 'accept' | 'decline'
+
+    if (!['accept', 'decline'].includes(action)) {
+      return res.status(400).json({ message: 'action must be "accept" or "decline".' });
+    }
 
     const vendorProfile = await VendorProfile.findOne({ vendorId: req.user.userId || req.user.id });
     if (!vendorProfile) return res.status(404).json({ message: 'Vendor not found' });
 
-    const announcement = await Announcement.findOne({ _id: id, vendor: vendorProfile._id })
-      .populate({
-        path: 'options.voters',
-        model: 'User',
-        select: 'name roomNumber location', // Only return the fields the vendor needs
-      });
+    const trial = await TrialOrder.findOne({ _id: id, vendor: vendorProfile._id });
+    if (!trial) return res.status(404).json({ message: 'Trial order not found.' });
 
-    if (!announcement) return res.status(404).json({ message: 'Announcement not found.' });
-    if (announcement.type !== 'Poll') return res.status(400).json({ message: 'Not a poll.' });
+    trial.status = action === 'accept' ? 'accepted' : 'declined';
+    await trial.save();
 
-    if (isNaN(idx) || idx < 0 || idx >= announcement.options.length) {
-      return res.status(400).json({ message: 'Invalid option index.' });
+    // Fire a push notification to the student (best-effort)
+    try {
+      const studentUser = await User.findById(trial.customer, 'fcmToken name').lean();
+      if (studentUser?.fcmToken) {
+        const statusText = action === 'accept' ? 'accepted ✅' : 'declined ❌';
+        await sendPushNotification(
+          studentUser.fcmToken,
+          `Trial Tiffin ${statusText}`,
+          `${vendorProfile.businessName} has ${action === 'accept' ? 'accepted' : 'declined'} your trial tiffin request.`,
+        );
+      }
+    } catch (notifErr) {
+      console.error('Trial notification error (non-fatal):', notifErr);
     }
 
-    const option = announcement.options[idx];
-    const voters = option.voters.map((user) => ({
-      name: user.name || 'Unknown',
-      roomNumber: user.roomNumber || 'N/A',
-      location: user.location || 'N/A',
-    }));
-
-    res.status(200).json({
-      optionText: option.text,
-      totalVotes: option.votes,
-      voters,
-    });
+    res.status(200).json({ message: `Trial order ${trial.status}.`, trial });
   } catch (error) {
-    console.error('Error fetching poll voters:', error);
-    res.status(500).json({ message: 'Server error fetching poll voters' });
+    console.error('Error responding to trial order:', error);
+    res.status(500).json({ message: 'Server error responding to trial order.' });
   }
 };

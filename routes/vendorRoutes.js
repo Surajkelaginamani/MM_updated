@@ -87,4 +87,9 @@ router.delete('/announcements/:id', verifyToken, vendorController.deleteAnnounce
 // 🔒 NEW: Poll Lock & Voter List endpoints
 router.put('/announcements/:id/toggle-lock', verifyToken, vendorController.togglePollLock);
 router.get('/announcements/:id/option/:optionIndex/voters', verifyToken, vendorController.getPollVoters);
-module.exports = router;
+
+// 🥑 Trial Tiffin Management
+router.get('/trials', verifyToken, vendorController.getTrialOrders);
+router.put('/trials/:id/respond', verifyToken, vendorController.respondToTrialOrder);
+
+module.exports = router;

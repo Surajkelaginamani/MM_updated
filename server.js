@@ -14,14 +14,20 @@ app.use(express.json()); // Allows us to read JSON data from the Flutter app
 // Make sure to create a .env file with your MONGO_URI string.
 console.log('Connecting to MongoDB:', process.env.MONGO_URI ? 'configured' : 'missing MONGO_URI');
 
+// --- CRON JOBS ---
+const { registerCronJobs } = require('./services/cronJobs');
+
 mongoose.connect(process.env.MONGO_URI, {
-  // Removed the deprecated useNewUrlParser and useUnifiedTopology!
-  tls: true,                            
-  tlsAllowInvalidCertificates: false,   
-  serverSelectionTimeoutMS: 10000        
-})   
+  tls: true,
+  tlsAllowInvalidCertificates: false,
+  serverSelectionTimeoutMS: 10000
+})
   .then(async () => {
     console.log('✅ MongoDB Connected Successfully');
+
+    // Register all scheduled jobs now that the DB is ready
+    registerCronJobs();
+
     try {
       const VendorProfile = require('./models/VendorProfile');
       const User = require('./models/User');

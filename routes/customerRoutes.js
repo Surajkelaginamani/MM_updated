@@ -48,4 +48,9 @@ router.get('/announcements', verifyToken, customerController.getKitchenAnnouncem
 router.get('/communication', verifyToken, customerController.getKitchenAnnouncements);
 router.post('/subscriptions/:id/renew', verifyToken, customerController.renewSubscription);
 router.post('/announcements/:announcementId/vote', verifyToken, customerController.voteOnPoll);
-module.exports = router;
+
+// 🥑 Trial Tiffin
+router.post('/book-trial', verifyToken, customerController.bookTrial);
+router.get('/my-trials', verifyToken, customerController.getMyTrials);
+
+module.exports = router;
