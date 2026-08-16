@@ -22,6 +22,79 @@ const parseDateKeyAsLocal = (dateKey) => {
   return new Date(year, month - 1, day, 0, 0, 0, 0);
 };
 
+// Helper to calculate exact endDate and vendorExtensionDays accounting for pre-existing VendorHolidays
+const calculateSubscriptionDatesWithVendorHolidays = async (vendorId, startDateInput, durationDays, preferredSession) => {
+  let startDate = startDateInput ? new Date(startDateInput) : new Date();
+  startDate.setHours(0, 0, 0, 0);
+
+  if (durationDays <= 1) {
+    const singleEnd = new Date(startDate);
+    singleEnd.setHours(23, 59, 59, 999);
+    return { endDate: singleEnd, vendorExtensionDays: 0 };
+  }
+
+  const startYear = startDate.getFullYear();
+  const startMonth = String(startDate.getMonth() + 1).padStart(2, '0');
+  const startDay = String(startDate.getDate()).padStart(2, '0');
+  const startStr = `${startYear}-${startMonth}-${startDay}`;
+
+  const allHolidays = await VendorHoliday.find({
+    vendor: vendorId,
+    dateKey: { $gte: startStr }
+  }).lean();
+
+  const holidayMap = new Map();
+  for (const h of allHolidays) {
+    holidayMap.set(h.dateKey, h);
+  }
+
+  let currentDate = new Date(startDate);
+  currentDate.setHours(0, 0, 0, 0);
+
+  let deliveryDaysCounted = 0;
+  let vendorExtensionDays = 0;
+  let lastDate = new Date(startDate);
+
+  let safetyCounter = 0;
+  const maxIterations = durationDays + 365;
+
+  while (deliveryDaysCounted < durationDays && safetyCounter < maxIterations) {
+    safetyCounter++;
+    const year = currentDate.getFullYear();
+    const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+    const day = String(currentDate.getDate()).padStart(2, '0');
+    const dateKey = `${year}-${month}-${day}`;
+
+    const holiday = holidayMap.get(dateKey);
+    let isVendorClosure = false;
+
+    if (holiday) {
+      const hTime = holiday.time || 'full_day';
+      if (hTime === 'full_day') {
+        isVendorClosure = true;
+      } else if (hTime === 'morning' && preferredSession === 'morning') {
+        isVendorClosure = true;
+      } else if (hTime === 'afternoon' && preferredSession === 'afternoon') {
+        isVendorClosure = true;
+      }
+    }
+
+    if (isVendorClosure) {
+      vendorExtensionDays += 1;
+    } else {
+      deliveryDaysCounted += 1;
+    }
+
+    lastDate = new Date(currentDate);
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+
+  const endDate = new Date(lastDate);
+  endDate.setHours(23, 59, 59, 999);
+
+  return { endDate, vendorExtensionDays };
+};
+
 const normalizeSessionValue = (value) => {
   if (!value) return '';
   const normalized = String(value).trim().toLowerCase();
@@ -97,12 +170,11 @@ const recomputeVendorRating = async (vendorId) => {
   });
   if (!vendorProfile) return;
 
+  const vendorIds = [vendorProfile._id, vendorProfile.vendorId].filter(Boolean);
   const allReviews = await Review.find({
     $or: [
-      { vendor: vendorProfile._id }, 
-      { vendor: vendorProfile.vendorId },
-      { vendorId: vendorProfile._id }, 
-      { vendorId: vendorProfile.vendorId }
+      { vendor: { $in: vendorIds } },
+      { vendorId: { $in: vendorIds } }
     ]
   });
 
@@ -285,6 +357,23 @@ exports.updateHolidays = async (req, res) => {
       ? subscription.skippedDates.filter(Boolean)
       : [];
 
+    // ── COMPUTE BASE DURATION BEFORE MUTATING skippedDates ──────────────────
+    // This must run now while subscription.endDate and subscription.skippedDates
+    // still reflect the unmodified DB state (no in-memory changes yet).
+    // Formula: strip vendor-extension days and student-holiday-extension days
+    // from the current endDate to recover the original plan window length.
+    const _vendorExtDaysSnapshot = subscription.vendorExtensionDays || 0;
+    const _oldConsideredCount = existingHolidays.filter(h => h && h.isConsideredForExtension).length;
+    const baseDuration = (subscription.endDate && subscription.startDate)
+      ? Math.max(
+          1,
+          Math.round(
+            (new Date(subscription.endDate) - new Date(subscription.startDate)) / (1000 * 60 * 60 * 24)
+          ) + 1 - _vendorExtDaysSnapshot - _oldConsideredCount
+        )
+      : getPlanDurationDays(subscription.planType);
+    // ────────────────────────────────────────────────────────────────────────
+
     // KEEP HISTORY (Past holidays)
     existingHolidays.forEach((holiday) => {
       if (!holiday || !holiday.date) return;
@@ -329,65 +418,19 @@ exports.updateHolidays = async (req, res) => {
     // This also ensures the final array saved to MongoDB is cleanly ordered for the UI.
     subscription.skippedDates.sort((a, b) => new Date(a.date) - new Date(b.date));
 
-    // 🚨 2. APPLY minimumHolidayDays CONSECUTIVE-DAY RULE 🚨
-
-    // Fetch vendor profile to read the threshold (default 1 = every single day counts)
-    const vendorProfile = await VendorProfile.findOne({ vendorId: subscription.vendor });
-    const minimumHolidayDays = (vendorProfile?.minimumHolidayDays) || 1;
-
-    // Collect only dates that are full-day-equivalent for this plan (reuses existing helper)
-    // subscription.skippedDates is already sorted above; .sort() here is a safety-net only.
-    const fullDayCandidateDates = subscription.skippedDates
-      .filter(h => determineIfConsidered(h.time))
-      .map(h => h.date)
-      .sort(); // YYYY-MM-DD lexicographic sort is chronological
-
-
-    // Group the candidate dates into consecutive runs
-    const consecutiveGroups = [];
-    let currentGroup = [];
-    for (const dateKey of fullDayCandidateDates) {
-      if (currentGroup.length === 0) {
-        currentGroup.push(dateKey);
-      } else {
-        const prev = parseDateKeyAsLocal(currentGroup[currentGroup.length - 1]);
-        const curr = parseDateKeyAsLocal(dateKey);
-        const diffDays = Math.round((curr - prev) / (1000 * 60 * 60 * 24));
-        if (diffDays === 1) {
-          currentGroup.push(dateKey);
-        } else {
-          consecutiveGroups.push(currentGroup);
-          currentGroup = [dateKey];
-        }
-      }
-    }
-    if (currentGroup.length > 0) consecutiveGroups.push(currentGroup);
-
-    // Only groups that meet the minimum threshold qualify for plan extension
-    const qualifyingDates = new Set();
-    for (const group of consecutiveGroups) {
-      if (group.length >= minimumHolidayDays) {
-        group.forEach(d => qualifyingDates.add(d));
-      }
-    }
-
-    // Stamp isConsideredForExtension on every entry in the merged list
-    // 🚨 BUG 2 FIX: Mongoose subdocuments must be converted to plain objects before
-    // spreading — otherwise the spread is a no-op and isConsideredForExtension is
-    // silently dropped, leaving the flag from the initial normalizedHolidays pass.
-    // Single-meal skips are never in qualifyingDates so they remain false automatically.
+    // 🚨 2. STAMP isConsideredForExtension DIRECTLY 🚨
+    // Every valid full-day equivalent leave immediately qualifies for extension
     subscription.skippedDates = subscription.skippedDates.map(h => ({
       ...(h.toObject ? h.toObject() : h),
-      isConsideredForExtension: qualifyingDates.has(h.date)
+      isConsideredForExtension: determineIfConsidered(h.time)
     }));
 
-// 🚨 3. RECALCULATE THE END DATE 🚨
+    // 🚨 3. RECALCULATE THE END DATE 🚨
     const consideredDaysCount = subscription.skippedDates.filter(h => h.isConsideredForExtension).length;
-    
+
     // FETCH THE PROTECTED VENDOR EXTENSIONS!
-    const vendorExtDays = subscription.vendorExtensionDays || 0; 
-    
-    const baseDuration = getPlanDurationDays(subscription.planType);
+    const vendorExtDays = subscription.vendorExtensionDays || 0;
+    // baseDuration was already computed above (before skippedDates was mutated) — see snapshot block.
     
     // 🚨 THE FIX 1: Capture the old date BEFORE we change it!
     const oldEndDate = subscription.endDate ? new Date(subscription.endDate) : null;
@@ -459,7 +502,33 @@ exports.getSubscriptionById = async (req, res) => {
       return res.status(404).json({ error: "Subscription not found for this customer." });
     }
 
-    res.status(200).json(subscription);
+    const subObj = subscription.toObject();
+    const vendorId = subscription.vendor?._id;
+
+    if (vendorId) {
+      const holidays = await VendorHoliday.find({ vendor: vendorId });
+      const planStart = subscription.startDate ? new Date(subscription.startDate).setHours(0, 0, 0, 0) : null;
+      const planEnd   = subscription.endDate   ? new Date(subscription.endDate).setHours(23, 59, 59, 999) : null;
+
+      const filteredHolidays = holidays
+        .filter((h) => {
+          if (!planStart || !planEnd) return true;
+          const [hYear, hMonth, hDay] = h.dateKey.split('-').map(Number);
+          const hTime = new Date(hYear, hMonth - 1, hDay, 0, 0, 0, 0).getTime();
+          return hTime >= planStart && hTime <= planEnd;
+        })
+        .map((h) => ({
+          dateKey: h.dateKey,
+          time: h.time || 'full_day',
+          reason: h.reason
+        }));
+
+      subObj.vendorHolidays = filteredHolidays;
+    } else {
+      subObj.vendorHolidays = [];
+    }
+
+    res.status(200).json(subObj);
   } catch (error) {
     console.error("Error fetching subscription:", error);
     res.status(500).json({ error: "Server error fetching subscription" });
@@ -490,12 +559,14 @@ exports.getCustomerDashboard = async (req, res) => {
     );
 
     const activeSubscriptions = allSubscriptions.filter((sub) => {
-      const statusMatch = String(sub.status || '').trim().toLowerCase() === 'active';
-      const endsInFuture = sub.endDate ? new Date(sub.endDate) >= todayMidnight : true;
+      const statusStr = String(sub.status || '').trim().toLowerCase();
+      const statusMatch = statusStr === 'active' || statusStr === 'paused';
+      const isPaused = statusStr === 'paused';
+      const endsInFuture = isPaused || (sub.endDate ? new Date(sub.endDate) >= todayMidnight : true);
 
       const tomorrowMidnight = new Date(todayMidnight);
       tomorrowMidnight.setDate(tomorrowMidnight.getDate() + 1);
-      const startedAlready = sub.startDate ? new Date(sub.startDate) < tomorrowMidnight : true;
+      const startedAlready = isPaused || (sub.startDate ? new Date(sub.startDate) < tomorrowMidnight : true);
 
       return statusMatch && endsInFuture && startedAlready;
     });
@@ -512,6 +583,7 @@ exports.getCustomerDashboard = async (req, res) => {
 
     let announcements = [];
     let weeklyMenus = [];
+    let todayClosures = [];
 
     if (activeSubscriptions.length > 0) {
       const vendorNamesMap = {};
@@ -540,6 +612,19 @@ exports.getCustomerDashboard = async (req, res) => {
           annObj.vendorName = vendorNamesMap[vIdStr] || 'Vendor';
           return annObj;
         });
+
+        // 🚨 TODAY'S KITCHEN CLOSURES — query VendorHoliday for the student's
+        // subscribed vendors on today's IST dateKey so the closure banner fires.
+        const todayClosuresRaw = await VendorHoliday.find({
+          vendor: { $in: activeVendorIds },
+          dateKey: menuDateInfo.dateKey,
+        }).lean();
+
+        todayClosures = todayClosuresRaw.map((c) => ({
+          vendorName: vendorNamesMap[String(c.vendor)] || 'Kitchen',
+          time: c.time || 'full_day',
+          reason: c.reason || '',
+        }));
       }
     }
 
@@ -624,16 +709,23 @@ exports.getCustomerDashboard = async (req, res) => {
 
     const hasUpcomingPlan = upcomingSubscriptions.length > 0;
 
+    const pendingSubscriptions = allSubscriptions.filter(
+      (sub) => String(sub.status || '').trim().toLowerCase() === 'pending'
+    );
+
     res.status(200).json({
       user: await User.findById(customerId).select('name email location'),
       subscriptions: activeSubscriptions,
       subscription: activeSubscriptions.length > 0 ? activeSubscriptions[0] : null,
+      pendingSubscriptions,
+      pendingRequests: pendingSubscriptions,
       hasPendingBill,
       hasUpcomingPlan,
       upcomingSubscriptions,
       subscribedMenus,
       weeklyMenus,
       announcements,
+      todayClosures,
       stats: {
         activeSubscriptions: activeSubscriptions.length + upcomingSubscriptions.length,
         totalOrders: 0,
@@ -762,15 +854,46 @@ exports.createSubscriptionRequest = async (req, res) => {
       }
     }
 
-    // 4. Handle start/end date calculation
+    // 4. Handle start/end date calculation taking pre-existing vendor holidays into account
     let startDate = null;
     let endDate   = null;
+    let initialVendorExtensionDays = 0;
 
     if (planType === 'single' || planDurationDays === 1) {
       // Single / trial meal: student picks an explicit date
       startDate = requestedDate ? new Date(requestedDate) : new Date();
       startDate.setHours(0, 0, 0, 0);
       endDate = new Date(startDate); // single-day; start == end
+    } else {
+      startDate = requestedDate ? new Date(requestedDate) : new Date();
+      startDate.setHours(0, 0, 0, 0);
+      const calc = await calculateSubscriptionDatesWithVendorHolidays(
+        vendor._id,
+        startDate,
+        planDurationDays,
+        preferredSession || 'both'
+      );
+      endDate = calc.endDate;
+      initialVendorExtensionDays = calc.vendorExtensionDays;
+    }
+
+    // 4b. Guard: Prevent duplicate active, pending, or paused subscription requests
+    const resolvedPlanName = planName || (selectedPlan ? selectedPlan.planName : planType) || 'Custom Plan';
+    const existingSub = await Subscription.findOne({
+      customer: customerId,
+      vendor: vendorId,
+      $or: [
+        { planName: req.body.planName || resolvedPlanName },
+        { planType: resolvedPlanName },
+        { planType: req.body.planType }
+      ],
+      status: { $in: ['pending', 'active', 'paused'] }
+    });
+
+    if (existingSub) {
+      return res.status(400).json({
+        message: 'You already have an active or pending request for this exact plan.'
+      });
     }
 
     // 5. Create the Subscription
@@ -782,6 +905,7 @@ exports.createSubscriptionRequest = async (req, res) => {
       preferredSession: preferredSession || 'both',
       startDate: startDate,
       endDate: endDate,
+      vendorExtensionDays: initialVendorExtensionDays,
       vendorConsidersHolidays: vendor.considersHolidays || false,
       totalBill: totalBill,
       paymentStatus: 'unpaid',
@@ -814,10 +938,52 @@ exports.createSubscriptionRequest = async (req, res) => {
     res.status(500).json({ message: 'Server error creating request.' });
   }
 };
+// Helper to sync an accepted TrialOrder into an active Subscription for Digital Khata
+const syncAcceptedTrialOrder = async (trial) => {
+  if (!trial || trial.status !== 'accepted') return;
+
+  const targetDateStr = trial.targetDate;
+  const [tYear, tMonth, tDay] = targetDateStr.split('-').map(Number);
+  const trialStartDate = new Date(tYear, tMonth - 1, tDay, 0, 0, 0, 0);
+  const trialEndDate = new Date(tYear, tMonth - 1, tDay, 23, 59, 59, 999);
+
+  const existingSub = await Subscription.findOne({
+    customer: trial.customer,
+    vendor: trial.vendor,
+    planType: 'Trial Tiffin',
+    startDate: {
+      $gte: trialStartDate,
+      $lte: trialEndDate
+    }
+  });
+
+  if (!existingSub) {
+    await Subscription.create({
+      customer: trial.customer,
+      vendor: trial.vendor,
+      planType: 'Trial Tiffin',
+      mealType: trial.targetSession === 'morning' ? 'Lunch' : 'Dinner',
+      preferredSession: trial.targetSession,
+      startDate: trialStartDate,
+      endDate: trialEndDate,
+      totalBill: trial.price || 0,
+      amountPaid: 0,
+      paymentStatus: 'unpaid',
+      status: 'active',
+    });
+  }
+};
+
 // Get all subscriptions for the logged-in customer
 exports.getMySubscriptions = async (req, res) => {
   try {
     const customerId = req.user.userId || req.user.id;
+
+    // Auto-sync any accepted trial orders for this customer into subscriptions so Khata stays updated
+    const acceptedTrials = await TrialOrder.find({ customer: customerId, status: 'accepted' });
+    for (const trial of acceptedTrials) {
+      await syncAcceptedTrialOrder(trial);
+    }
 
     // Find all subscriptions for this user and populate the vendor's business name
     const subscriptions = await Subscription.find({ customer: customerId })
@@ -841,12 +1007,57 @@ exports.getMySubscriptions = async (req, res) => {
       return acc;
     }, {});
 
+    // Auto-sync any active subscriptions that have pre-existing vendor closures not yet credited to vendorExtensionDays & endDate
+    for (const sub of subscriptions) {
+      if (sub.status === 'active' && sub.startDate && sub.endDate && sub.vendor) {
+        const vendorId = sub.vendor._id || sub.vendor;
+        const allVendorHols = vendorHolidayMap[vendorId.toString()] || [];
+
+        const planStart = new Date(sub.startDate).setHours(0, 0, 0, 0);
+        let currentEnd = new Date(sub.endDate).setHours(23, 59, 59, 999);
+
+        const matchingHols = allVendorHols.filter(h => {
+          const [hYear, hMonth, hDay] = h.dateKey.split('-').map(Number);
+          const hTime = new Date(hYear, hMonth - 1, hDay, 0, 0, 0, 0).getTime();
+          if (hTime < planStart || hTime > currentEnd) return false;
+          const hTimeSlot = h.time || 'full_day';
+          if (hTimeSlot === 'full_day') return true;
+          if (hTimeSlot === 'morning' && sub.preferredSession === 'morning') return true;
+          if (hTimeSlot === 'afternoon' && sub.preferredSession === 'afternoon') return true;
+          return false;
+        });
+
+        const diff = matchingHols.length - (sub.vendorExtensionDays || 0);
+        if (diff > 0) {
+          sub.vendorExtensionDays = (sub.vendorExtensionDays || 0) + diff;
+          sub.endDate = new Date(new Date(sub.endDate).getTime() + diff * 24 * 60 * 60 * 1000);
+          await Subscription.updateOne(
+            { _id: sub._id },
+            { $set: { vendorExtensionDays: sub.vendorExtensionDays, endDate: sub.endDate } }
+          );
+        }
+      }
+    }
+
     const enriched = subscriptions.map((sub) => {
       const vendorId = sub.vendor?._id?.toString();
       const subObj = sub.toObject();
+
+      // ── Filter holidays to only those within this subscription's date window ──
+      const allVendorHolidays = vendorId ? vendorHolidayMap[vendorId] || [] : [];
+      const planStart = sub.startDate ? new Date(sub.startDate).setHours(0, 0, 0, 0) : null;
+      const planEnd   = sub.endDate   ? new Date(sub.endDate).setHours(23, 59, 59, 999) : null;
+
+      const filteredHolidays = allVendorHolidays.filter((h) => {
+        if (!planStart || !planEnd) return false;
+        const [hYear, hMonth, hDay] = h.dateKey.split('-').map(Number);
+        const hTime = new Date(hYear, hMonth - 1, hDay, 0, 0, 0, 0).getTime();
+        return hTime >= planStart && hTime <= planEnd;
+      });
+
       return {
         ...subObj,
-        vendorHolidays: vendorId ? vendorHolidayMap[vendorId] || [] : []
+        vendorHolidays: filteredHolidays
       };
     });
 
@@ -862,7 +1073,7 @@ exports.getSubscribedWeeklyMenus = async (req, res) => {
     const customerId = req.user.userId || req.user.id;
     const activeSubscriptions = await Subscription.find({
       customer: customerId,
-      status: 'active'
+      status: { $in: ['active', 'paused'] }
     }).populate('vendor', 'businessName weeklyMenu');
 
     const menus = activeSubscriptions
@@ -933,7 +1144,7 @@ exports.getMyOrders = async (req, res) => {
         startDate: sub.startDate,
         endDate: sub.endDate,
         deliveryType: sub.vendor?.deliveryType || 'Delivery',
-        totalAmount: sub.price || 0,
+        totalAmount: sub.totalBill || sub.price || 0,
         isPast
       };
     });
@@ -1088,37 +1299,47 @@ exports.getCustomerReviews = async (req, res) => {
 
     const [allReviews, myReviews] = await Promise.all([
       Review.find({})
-        .populate('vendorId', 'name email')
-        .populate('customerId', 'name')
+        .populate('vendor', 'businessName name')
+        .populate('vendorId', 'businessName name')
+        .populate('customer', 'name roomNumber location')
+        .populate('customerId', 'name roomNumber location')
         .sort({ createdAt: -1 }),
-      Review.find({ customerId: customerId })
-        .populate('vendorId', 'name email')
+      Review.find({
+        $or: [{ customer: customerId }, { customerId: customerId }]
+      })
+        .populate('vendor', 'businessName name')
+        .populate('vendorId', 'businessName name')
         .sort({ createdAt: -1 })
     ]);
 
     const formattedAllReviews = allReviews
-      .filter((review) => review.vendorId && review.customerId)
-      .map((review) => ({
-        _id: review._id,
-        vendorId: review.vendorId._id,
-        vendorName: review.vendorId.name || 'Kitchen',
-        customerName: review.customerId.name || 'Student',
-        rating: review.rating,
-        text: review.comment || '',
-        createdAt: review.createdAt,
-        isMine: String(review.customerId._id) === String(customerId)
-      }));
+      .map((review) => {
+        const v = review.vendor || review.vendorId;
+        const c = review.customer || review.customerId;
+        return {
+          _id: review._id,
+          vendorId: v ? v._id : null,
+          vendorName: v ? (v.businessName || v.name || 'Kitchen') : 'Kitchen',
+          customerName: c ? (c.name || 'Student') : 'Student',
+          rating: review.rating,
+          text: review.comment || review.text || '',
+          createdAt: review.createdAt,
+          isMine: c ? (String(c._id) === String(customerId)) : false
+        };
+      });
 
     const formattedMyReviews = myReviews
-      .filter((review) => review.vendorId)
-      .map((review) => ({
-        _id: review._id,
-        vendorId: review.vendorId._id,
-        vendorName: review.vendorId.name || 'Kitchen',
-        rating: review.rating,
-        text: review.comment || '',
-        createdAt: review.createdAt
-      }));
+      .map((review) => {
+        const v = review.vendor || review.vendorId;
+        return {
+          _id: review._id,
+          vendorId: v ? v._id : null,
+          vendorName: v ? (v.businessName || v.name || 'Kitchen') : 'Kitchen',
+          rating: review.rating,
+          text: review.comment || review.text || '',
+          createdAt: review.createdAt
+        };
+      });
 
     res.status(200).json({
       allReviews: formattedAllReviews,
@@ -1126,6 +1347,52 @@ exports.getCustomerReviews = async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching customer reviews:", error);
+    res.status(500).json({ message: 'Server error fetching reviews' });
+  }
+};
+
+// GET /api/customer/vendors/:vendorId/reviews
+exports.getVendorReviews = async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    const vendorProfile = await VendorProfile.findOne({
+      $or: [{ _id: vendorId }, { vendorId: vendorId }]
+    }).select('rating totalReviews businessName ownerName');
+
+    if (!vendorProfile) {
+      return res.status(404).json({ message: 'Vendor profile not found' });
+    }
+
+    const vendorIds = [vendorProfile._id, vendorProfile.vendorId, vendorId].filter(Boolean);
+    const reviews = await Review.find({
+      $or: [
+        { vendor: { $in: vendorIds } },
+        { vendorId: { $in: vendorIds } }
+      ]
+    })
+      .populate('customer', 'name roomNumber location')
+      .populate('customerId', 'name roomNumber location')
+      .sort({ createdAt: -1 });
+
+    const formattedReviews = reviews.map((r) => {
+      const c = r.customer || r.customerId;
+      return {
+        _id: r._id,
+        customerName: c ? (c.name || 'Student') : 'Student',
+        rating: r.rating || 5,
+        comment: (r.comment || r.text || '').toString().trim(),
+        createdAt: r.createdAt,
+      };
+    });
+
+    res.status(200).json({
+      averageRating: vendorProfile.rating || 0,
+      totalReviews: vendorProfile.totalReviews || 0,
+      reviews: formattedReviews
+    });
+  } catch (error) {
+    console.error("Error fetching vendor reviews for customer:", error);
     res.status(500).json({ message: 'Server error fetching reviews' });
   }
 };
@@ -1216,81 +1483,67 @@ exports.getCustomerPayments = async (req, res) => {
   try {
     const customerId = req.user.userId || req.user.id;
 
-    // Fetch the active subscription for this customer
-    const activeSub = await Subscription.findOne({
+    // Fetch active, paused, or cancelled subscriptions for this customer
+    const subscriptions = await Subscription.find({
       customer: customerId,
-      status: 'active' 
+      status: { $in: ['active', 'paused', 'cancelled'] } 
     }).populate('vendor', 'businessName');
 
-    if (!activeSub) {
-        return res.status(200).json({
-            pendingAmount: 0,
-            totalPaid: 0,
-            thisMonth: 0,
-            transactions: []
-        });
+    if (!subscriptions || subscriptions.length === 0) {
+      return res.status(200).json({
+        pendingAmount: 0,
+        totalPaid: 0,
+        thisMonth: 0,
+        transactions: []
+      });
     }
 
     const today = new Date();
-    let baseDuration = 30;
-    if (activeSub.planType.includes('weekly') || activeSub.planType.includes('7_days')) baseDuration = 7;
-    if (activeSub.planType.includes('15_days')) baseDuration = 15;
-
-    const skippedDaysCount = activeSub.skippedDates ? activeSub.skippedDates.length : 0;
-    const totalSpan = baseDuration + skippedDaysCount;
-
-    const startDate = new Date(activeSub.startDate || activeSub.createdAt);
-    const fallbackEndDate = new Date(startDate);
-    fallbackEndDate.setDate(fallbackEndDate.getDate() + totalSpan);
-    const endDate = activeSub.endDate ? new Date(activeSub.endDate) : fallbackEndDate;
-
-    const diffTime = endDate.getTime() - today.getTime();
-    const daysLeft = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
     let pendingAmount = 0;
-    let transactions = [];
-
-    // Determine Pending Amount
-    if (activeSub.paymentStatus === 'unpaid' || daysLeft <= 5) {
-        pendingAmount = activeSub.price;
-        // Add a "Pending" transaction record
-        transactions.push({
-            id: `pending-${activeSub._id}`,
-            vendorName: activeSub.vendor.businessName,
-            type: 'Subscription',
-            status: 'pending',
-            date: 'Due Now',
-            method: 'Pending',
-            amount: activeSub.price
-        });
-    }
-
-    // Determine Total Paid & This Month (Simplification: Assuming if paid, they paid the price)
-    // In a real app, you'd have a separate 'Transactions' table. Here we infer from the subscription state.
     let totalPaid = 0;
     let thisMonthPaid = 0;
+    let transactions = [];
 
-    if (activeSub.paymentStatus === 'paid') {
-        totalPaid += activeSub.price;
+    subscriptions.forEach((sub) => {
+      const totalBill = Number(sub.totalBill || sub.price) || 0;
+      const amountPaid = Number(sub.amountPaid) || 0;
+      const vendorName = sub.vendor?.businessName || 'Kitchen';
+      const pStatus = String(sub.paymentStatus || 'unpaid').toLowerCase();
+
+      if (pStatus === 'unpaid' || pStatus === 'partial') {
+        const remaining = Math.max(0, totalBill - amountPaid);
+        pendingAmount += remaining;
+        transactions.push({
+          id: `pending-${sub._id}`,
+          vendorName: vendorName,
+          type: 'Subscription',
+          status: 'pending',
+          date: 'Due Now',
+          method: 'Pending',
+          amount: remaining
+        });
+      }
+
+      if (pStatus === 'paid' || amountPaid > 0) {
+        const paidVal = pStatus === 'paid' ? totalBill : amountPaid;
+        totalPaid += paidVal;
         
-        // Check if paid this month
-        const paymentDate = activeSub.lastPaymentDate ? new Date(activeSub.lastPaymentDate) : startDate;
+        const paymentDate = sub.updatedAt || sub.createdAt || today;
         if (paymentDate.getMonth() === today.getMonth() && paymentDate.getFullYear() === today.getFullYear()) {
-            thisMonthPaid += activeSub.price;
+          thisMonthPaid += paidVal;
         }
 
-        // Add a "Paid" transaction record
-        const formattedDate = paymentDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
         transactions.push({
-            id: `paid-${activeSub._id}`,
-            vendorName: activeSub.vendor.businessName,
-            type: 'Subscription',
-            status: 'paid',
-            date: formattedDate,
-            method: 'UPI / Cash', // Mock method
-            amount: activeSub.price
+          id: `paid-${sub._id}`,
+          vendorName: vendorName,
+          type: 'Subscription',
+          status: 'paid',
+          date: paymentDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+          method: 'UPI / Cash',
+          amount: paidVal
         });
-    }
+      }
+    });
 
     res.status(200).json({
       pendingAmount,
@@ -1381,7 +1634,7 @@ exports.getKitchenAnnouncements = async (req, res) => {
     // 1. Find all active subscriptions for this student to aggregate announcements from all vendors
     const activeSubscriptions = await Subscription.find({ 
       customer: customerId, 
-      status: 'active' 
+      status: { $in: ['active', 'paused'] } 
     }).populate('vendor', 'businessName ownerName');
 
     if (!activeSubscriptions || activeSubscriptions.length === 0) {
@@ -1578,13 +1831,19 @@ exports.renewSubscription = async (req, res) => {
       }
     }
 
-    const newEndDate = new Date(newStartDate);
-    newEndDate.setDate(newEndDate.getDate() + (durationDays - 1));
+    // 4b. Calculate newEndDate taking pre-existing vendor holidays into account
+    const { endDate: newEndDate, vendorExtensionDays: renewalVendorExtensionDays } =
+      await calculateSubscriptionDatesWithVendorHolidays(
+        oldSub.vendor,
+        newStartDate,
+        durationDays,
+        oldSub.preferredSession || 'both'
+      );
 
     // 5. Create the Renewed Plan (Queued as upcoming)
     // NOTE: mark as 'pending' so it doesn't appear as currently active immediately
     // The UI will still surface it as an upcoming plan for this customer only.
-// Inside renewSubscription -> Subscription.create
+    // Inside renewSubscription -> Subscription.create
     const renewedSub = await Subscription.create({
       customer: customerId,
       vendor: oldSub.vendor,
@@ -1593,6 +1852,7 @@ exports.renewSubscription = async (req, res) => {
       preferredSession: oldSub.preferredSession,
       startDate: newStartDate,
       endDate: newEndDate,
+      vendorExtensionDays: renewalVendorExtensionDays,
       vendorConsidersHolidays: oldSub.vendorConsidersHolidays,
       totalBill: newTotalBill,
       paymentStatus: 'unpaid',

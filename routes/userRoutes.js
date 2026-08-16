@@ -9,4 +9,7 @@ router.post('/update-token', verifyToken, notificationController.updateFcmToken)
 // Required: PUT /api/users/update-fcm-token (used by the Flutter app)
 router.put('/update-fcm-token', verifyToken, notificationController.updateFcmToken);
 
+// Clear FCM token on logout so the device no longer receives notifications for the signed-out user
+router.post('/logout', verifyToken, notificationController.clearFcmToken);
+
 module.exports = router;

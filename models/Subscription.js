@@ -21,7 +21,12 @@ const subscriptionSchema = new mongoose.Schema({
   
   // 🚨 THE POSTPAID LEDGER 🚨
   totalBill: { type: Number, required: true, default: 0 },
-  status: { type: String, enum: ['pending', 'active', 'cancelled'], default: 'pending' },
+  status: { type: String, enum: ['pending', 'active', 'paused', 'cancelled'], default: 'pending' },
+  pausedAt: { type: Date, default: null },                         // Set when plan is paused
+  pausedPeriods: [{
+    pausedOn:  { type: Date, required: true },                     // When vendor paused the plan
+    resumedOn: { type: Date, required: true },                     // When vendor resumed the plan
+  }],
   paymentStatus: { 
     type: String, 
     enum: ['unpaid', 'partial', 'paid'], 

@@ -31,6 +31,23 @@ exports.updateFcmToken = async (req, res) => {
   }
 };
 
+// 1b. Clear the FCM token on logout — prevents notifications reaching signed-out users
+exports.clearFcmToken = async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id || req.user._id;
+    if (!userId) {
+      return res.status(400).json({ message: 'User identity could not be determined.' });
+    }
+
+    await User.findByIdAndUpdate(userId, { fcmToken: null });
+    console.log(`🔕 FCM Token cleared for user: ${userId}`);
+    return res.status(200).json({ message: 'FCM Token cleared successfully.' });
+  } catch (error) {
+    console.error('❌ Error clearing FCM token:', error);
+    return res.status(500).json({ message: 'Server error clearing token.' });
+  }
+};
+
 // 2. Reusable Helper function to send actual alerts
 exports.sendPushNotification = async (targetFcmToken, title, body) => {
   if (!targetFcmToken) return; // If user has no device registered, skip safely

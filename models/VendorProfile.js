@@ -36,12 +36,8 @@ const vendorProfileSchema = new mongoose.Schema({
   trialPrice: { type: Number, default: 0 },
 
   // --- 🚨 THE MASTER HOLIDAY POLICY TOGGLE 🚨 ---
+  vendorConsidersHolidays: { type: Boolean, default: false },
   considersHolidays: { type: Boolean, default: false },
-
-  // --- ✅ MINIMUM LEAVE DAYS THRESHOLD ---
-  // A student must take at least this many consecutive/total leave days
-  // for the vendor to extend their subscription end date.
-  minimumHolidayDays: { type: Number, default: 1, min: 1 },
 
   // --- MENU & COMMUNICATION ---
   weeklyMenu: {

@@ -38,6 +38,8 @@ router.get('/homemade/orders', verifyToken, customerController.getMyHomemadeOrde
 
 // --- Reviews ---
 router.get('/reviews', verifyToken, customerController.getCustomerReviews);
+router.get('/vendors/:vendorId/reviews', verifyToken, customerController.getVendorReviews);
+router.get('/reviews/:vendorId', verifyToken, customerController.getVendorReviews);
 router.post('/reviews', verifyToken, customerController.createOrUpdateReview);
 router.post('/reviews/:vendorId', verifyToken, customerController.submitReview);
 router.delete('/reviews/:reviewId', verifyToken, customerController.deleteMyReview);

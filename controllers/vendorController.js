@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const VendorProfile = require('../models/VendorProfile');
 const Subscription = require('../models/Subscription');
 const User = require('../models/User');
@@ -24,6 +25,79 @@ const parseBoolean = (value, fallback = false) => {
 };
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+// Helper to calculate exact endDate and vendorExtensionDays accounting for pre-existing VendorHolidays
+const calculateSubscriptionDatesWithVendorHolidays = async (vendorId, startDateInput, durationDays, preferredSession) => {
+  let startDate = startDateInput ? new Date(startDateInput) : new Date();
+  startDate.setHours(0, 0, 0, 0);
+
+  if (durationDays <= 1) {
+    const singleEnd = new Date(startDate);
+    singleEnd.setHours(23, 59, 59, 999);
+    return { endDate: singleEnd, vendorExtensionDays: 0 };
+  }
+
+  const startYear = startDate.getFullYear();
+  const startMonth = String(startDate.getMonth() + 1).padStart(2, '0');
+  const startDay = String(startDate.getDate()).padStart(2, '0');
+  const startStr = `${startYear}-${startMonth}-${startDay}`;
+
+  const allHolidays = await VendorHoliday.find({
+    vendor: vendorId,
+    dateKey: { $gte: startStr }
+  }).lean();
+
+  const holidayMap = new Map();
+  for (const h of allHolidays) {
+    holidayMap.set(h.dateKey, h);
+  }
+
+  let currentDate = new Date(startDate);
+  currentDate.setHours(0, 0, 0, 0);
+
+  let deliveryDaysCounted = 0;
+  let vendorExtensionDays = 0;
+  let lastDate = new Date(startDate);
+
+  let safetyCounter = 0;
+  const maxIterations = durationDays + 365;
+
+  while (deliveryDaysCounted < durationDays && safetyCounter < maxIterations) {
+    safetyCounter++;
+    const year = currentDate.getFullYear();
+    const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+    const day = String(currentDate.getDate()).padStart(2, '0');
+    const dateKey = `${year}-${month}-${day}`;
+
+    const holiday = holidayMap.get(dateKey);
+    let isVendorClosure = false;
+
+    if (holiday) {
+      const hTime = holiday.time || 'full_day';
+      if (hTime === 'full_day') {
+        isVendorClosure = true;
+      } else if (hTime === 'morning' && preferredSession === 'morning') {
+        isVendorClosure = true;
+      } else if (hTime === 'afternoon' && preferredSession === 'afternoon') {
+        isVendorClosure = true;
+      }
+    }
+
+    if (isVendorClosure) {
+      vendorExtensionDays += 1;
+    } else {
+      deliveryDaysCounted += 1;
+    }
+
+    lastDate = new Date(currentDate);
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+
+  const endDate = new Date(lastDate);
+  endDate.setHours(23, 59, 59, 999);
+
+  return { endDate, vendorExtensionDays };
+};
 
 const mapLikeToObject = (value) => {
   if (!value) return {};
@@ -213,7 +287,20 @@ exports.getVendorDashboard = async (req, res) => {
       vendor: vendorProfile._id,
       status: 'active'
     }).populate('customer', 'name email phone');
-const ongoingSubscriptions = activeSubscriptions.filter(sub => {
+    const today = new Date();
+    today.setHours(today.getHours() + 5);
+    today.setMinutes(today.getMinutes() + 30);
+    const todayString = today.toISOString().split('T')[0];
+    const todayStart = new Date(todayString);
+    todayStart.setHours(0, 0, 0, 0);
+
+    const ongoingSubscriptions = activeSubscriptions.filter(sub => {
+      if (!sub.customer) return false;
+      if (sub.endDate) {
+        const end = new Date(sub.endDate);
+        end.setHours(23, 59, 59, 999);
+        return end >= todayStart;
+      }
       const planType = (sub.planType || '').toLowerCase();
       let baseDuration = 30; // Default monthly
       if (planType.includes('weekly') || planType.includes('7_days')) baseDuration = 7;
@@ -236,14 +323,12 @@ const ongoingSubscriptions = activeSubscriptions.filter(sub => {
       const startDate = new Date(sub.startDate || sub.createdAt);
       startDate.setHours(0, 0, 0, 0); // Set to midnight
       
-      const endDate = new Date(startDate);
-      endDate.setDate(startDate.getDate() + baseDuration + extensionDays - 1); // Subtract 1 because start date is day 1
-      
-      const today = new Date();
-      today.setHours(0, 0, 0, 0); // Set to midnight
+      const calcEnd = new Date(startDate);
+      calcEnd.setDate(startDate.getDate() + baseDuration + extensionDays - 1);
+      calcEnd.setHours(23, 59, 59, 999);
       
       // Keep it ONLY if today is before or equal to the end date
-      return today <= endDate; 
+      return calcEnd >= todayStart; 
     });
     const homemadeOrderCount = await HomemadeOrder.countDocuments({ vendor: vendorProfile._id });
     const homemadePendingOrders = await HomemadeOrder.countDocuments({
@@ -251,9 +336,30 @@ const ongoingSubscriptions = activeSubscriptions.filter(sub => {
       status: { $in: ['placed', 'confirmed'] }
     });
 
-const uniqueCustomers = await Subscription.distinct('customer', { vendor: vendorProfile._id, status: 'active' });
-const totalCustomers = uniqueCustomers.length;
-    const monthlyRevenue = activeSubscriptions.reduce((sum, sub) => sum + sub.price, 0);
+    // Paused subscriptions — fetched so the dashboard can surface an amber
+    // "N plans paused" banner and a searchable bottom sheet of affected students.
+    const pausedSubs = await Subscription.find({
+      vendor: vendorProfile._id,
+      status: 'paused',
+    })
+      .populate('customer', 'name roomNumber phone location')
+      .lean();
+
+    const pausedPlansList = pausedSubs.map(sub => ({
+      customerName: sub.customer?.name       || 'Unknown',
+      roomNumber:   sub.customer?.roomNumber || '',
+      location:     sub.customer?.location   || '',
+      phone:        sub.customer?.phone      || '',
+      planType:     sub.planType             || 'Plan',
+    }));
+
+    const uniqueCustomerIds = new Set(
+      ongoingSubscriptions
+        .filter(sub => (sub.planType || '').toLowerCase() !== 'single' && sub.customer)
+        .map(sub => (sub.customer._id || sub.customer).toString())
+    );
+    const totalCustomers = uniqueCustomerIds.size;
+    const monthlyRevenue = activeSubscriptions.reduce((sum, sub) => sum + (sub.totalBill || sub.price || 0), 0);
     const now = new Date();
     const dailyMenuDoc = await DailyMenu.findOne(
       buildTodayMenuQuery(vendorProfile._id, now)
@@ -279,6 +385,7 @@ const totalCustomers = uniqueCustomers.length;
       pendingTrials,
       activeSubscriptions,
       todaysMenu,
+      pausedPlansList,
       stats: {
         totalCustomers,
         monthlyRevenue,
@@ -311,10 +418,16 @@ exports.getVendorReviews = async (req, res) => {
     }
 
     // 2. Fetch all reviews for this kitchen
-    // We use .populate() to get the student's name and room number so the vendor knows who wrote it!
-    const reviews = await Review.find({ vendorId: profile._id })
+    const vendorIds = [profile._id, profile.vendorId, vendorId].filter(Boolean);
+    const reviews = await Review.find({
+      $or: [
+        { vendor: { $in: vendorIds } },
+        { vendorId: { $in: vendorIds } }
+      ]
+    })
+      .populate('customer', 'name roomNumber location')
       .populate('customerId', 'name roomNumber location')
-      .sort({ createdAt: -1 }); // Newest reviews first
+      .sort({ createdAt: -1 });
 
     // 3. Send it to the Flutter app
     res.status(200).json({
@@ -425,14 +538,122 @@ exports.getVendorSubscriptions = async (req, res) => {
       return res.status(404).json({ message: 'Vendor profile not found' });
     }
 
-    const subscriptions = await Subscription.find({ vendor: vendorProfile._id })
+    // Auto-sync any accepted trial orders for this vendor into subscriptions so Khata stays updated
+    const acceptedTrials = await TrialOrder.find({ vendor: vendorProfile._id, status: 'accepted' });
+    for (const trial of acceptedTrials) {
+      await syncAcceptedTrialOrder(trial);
+    }
+
+    const subscriptions = await Subscription.find({
+      vendor: vendorProfile._id,
+      status: { $ne: 'pending' }
+    })
       .populate('customer', 'name phone location roomNumber')
       .sort({ createdAt: -1 });
 
-    res.status(200).json(subscriptions);
+    const allVendorHolidays = await VendorHoliday.find({ vendor: vendorProfile._id }).lean();
+
+    // Auto-sync any active subscriptions that have pre-existing vendor closures not yet credited to vendorExtensionDays & endDate
+    for (const sub of subscriptions) {
+      if (sub.status === 'active' && sub.startDate && sub.endDate) {
+        const planStart = new Date(sub.startDate).setHours(0, 0, 0, 0);
+        let currentEnd = new Date(sub.endDate).setHours(23, 59, 59, 999);
+
+        const matchingHols = allVendorHolidays.filter(h => {
+          const [hYear, hMonth, hDay] = h.dateKey.split('-').map(Number);
+          const hTime = new Date(hYear, hMonth - 1, hDay, 0, 0, 0, 0).getTime();
+          if (hTime < planStart || hTime > currentEnd) return false;
+          const hTimeSlot = h.time || 'full_day';
+          if (hTimeSlot === 'full_day') return true;
+          if (hTimeSlot === 'morning' && sub.preferredSession === 'morning') return true;
+          if (hTimeSlot === 'afternoon' && sub.preferredSession === 'afternoon') return true;
+          return false;
+        });
+
+        const diff = matchingHols.length - (sub.vendorExtensionDays || 0);
+        if (diff > 0) {
+          sub.vendorExtensionDays = (sub.vendorExtensionDays || 0) + diff;
+          sub.endDate = new Date(new Date(sub.endDate).getTime() + diff * 24 * 60 * 60 * 1000);
+          await Subscription.updateOne(
+            { _id: sub._id },
+            { $set: { vendorExtensionDays: sub.vendorExtensionDays, endDate: sub.endDate } }
+          );
+        }
+      }
+    }
+
+    const enriched = subscriptions.map((sub) => {
+      const subObj = sub.toObject ? sub.toObject() : sub;
+      const planStart = sub.startDate ? new Date(sub.startDate).setHours(0, 0, 0, 0) : null;
+      const planEnd   = sub.endDate   ? new Date(sub.endDate).setHours(23, 59, 59, 999) : null;
+
+      subObj.vendorHolidays = allVendorHolidays
+        .filter((h) => {
+          if (!planStart || !planEnd) return true;
+          const [hYear, hMonth, hDay] = h.dateKey.split('-').map(Number);
+          const hTime = new Date(hYear, hMonth - 1, hDay, 0, 0, 0, 0).getTime();
+          return hTime >= planStart && hTime <= planEnd;
+        })
+        .map((h) => ({
+          dateKey: h.dateKey,
+          time: h.time || 'full_day',
+          reason: h.reason
+        }));
+
+      return subObj;
+    });
+
+    res.status(200).json(enriched);
   } catch (error) {
     console.error("Error fetching vendor subscriptions:", error);
     res.status(500).json({ message: 'Server error fetching subscriptions' });
+  }
+};
+
+// GET /api/vendor/subscriptions/:id — single subscription with vendor holidays
+exports.getVendorSubscriptionById = async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+    const vendorProfile = await VendorProfile.findOne({ vendorId: userId });
+    if (!vendorProfile) {
+      return res.status(404).json({ message: 'Vendor profile not found.' });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid subscription ID.' });
+    }
+
+    const subscription = await Subscription.findOne({
+      _id: req.params.id,
+      vendor: vendorProfile._id
+    }).populate('customer', 'name phone location roomNumber');
+
+    if (!subscription) {
+      return res.status(404).json({ message: 'Subscription not found.' });
+    }
+
+    const subObj = subscription.toObject();
+    const planStart = subscription.startDate ? new Date(subscription.startDate).setHours(0, 0, 0, 0) : null;
+    const planEnd   = subscription.endDate   ? new Date(subscription.endDate).setHours(23, 59, 59, 999) : null;
+
+    const allVendorHolidays = await VendorHoliday.find({ vendor: vendorProfile._id }).lean();
+    subObj.vendorHolidays = allVendorHolidays
+      .filter((h) => {
+        if (!planStart || !planEnd) return true;
+        const [hYear, hMonth, hDay] = h.dateKey.split('-').map(Number);
+        const hTime = new Date(hYear, hMonth - 1, hDay, 0, 0, 0, 0).getTime();
+        return hTime >= planStart && hTime <= planEnd;
+      })
+      .map((h) => ({
+        dateKey: h.dateKey,
+        time: h.time || 'full_day',
+        reason: h.reason
+      }));
+
+    res.status(200).json(subObj);
+  } catch (error) {
+    console.error('Error fetching vendor subscription by id:', error);
+    res.status(500).json({ message: 'Server error fetching subscription.' });
   }
 };
 
@@ -656,9 +877,7 @@ exports.getVendorProfileSettings = async (req, res) => {
       foodType: vendorProfile.foodType,
       // ✅ New flexible plans array (includes isActive)
       customPlans: vendorProfile.customPlans || [],
-      vendorConsidersHolidays: vendorProfile.considersHolidays,
-      // ✅ Minimum leave days threshold
-      minimumHolidayDays: vendorProfile.minimumHolidayDays ?? 1,
+      vendorConsidersHolidays: vendorProfile.vendorConsidersHolidays ?? vendorProfile.considersHolidays ?? false,
       // ✅ Trial tiffin price
       trialPrice: vendorProfile.trialPrice ?? 0,
     });
@@ -671,13 +890,12 @@ exports.getVendorProfileSettings = async (req, res) => {
 
 exports.updateVendorProfileSettings = async (req, res) => {
   try {
-    const userId = req.user.userId;
+    const userId = req.user.userId || req.user.id;
     const { 
       name, phone, businessName, serviceArea, foodType,
-      customPlans,          // ✅ New flexible plans array (now includes isActive)
+      customPlans,
       vendorConsidersHolidays,
-      minimumHolidayDays,   // ✅ Minimum leave days threshold
-      trialPrice            // ✅ Trial tiffin price
+      trialPrice
     } = req.body;
 
     // 1. Initialize update objects
@@ -697,22 +915,47 @@ exports.updateVendorProfileSettings = async (req, res) => {
     if (businessName !== undefined)    vendorUpdates.businessName    = businessName;
     if (serviceArea !== undefined)     vendorUpdates.serviceArea     = serviceArea;
     if (foodType !== undefined)        vendorUpdates.foodType        = foodType;
-    if (vendorConsidersHolidays !== undefined) vendorUpdates.considersHolidays = vendorConsidersHolidays;
-    if (minimumHolidayDays !== undefined && !isNaN(Number(minimumHolidayDays))) {
-      vendorUpdates.minimumHolidayDays = Math.max(1, Number(minimumHolidayDays));
+
+    // 🔧 BUG FIX: Parse the boolean properly regardless of whether the client
+    // sends it as a JSON boolean (true/false) or a string ('true'/'false').
+    let parsedHolidayToggle;
+    if (vendorConsidersHolidays !== undefined) {
+      parsedHolidayToggle = parseBoolean(vendorConsidersHolidays);
+      vendorUpdates.vendorConsidersHolidays = parsedHolidayToggle;
+      vendorUpdates.considersHolidays = parsedHolidayToggle;  // keep legacy field in sync
     }
-    // ✅ Replace entire plans array atomically (preserves isActive flag from client)
+
+    // Replace entire plans array atomically (preserves isActive flag from client)
     if (Array.isArray(customPlans))    vendorUpdates.customPlans     = customPlans;
-    // ✅ Trial tiffin price
+
+    // Trial tiffin price
     if (trialPrice !== undefined && !isNaN(Number(trialPrice))) {
       vendorUpdates.trialPrice = Math.max(0, Number(trialPrice));
     }
 
+    // 🔧 BUG FIX: Wrap in $set so Mongoose does a partial update (not replace),
+    // and disable runValidators because subdocument required-field validators
+    // on customPlans can throw spurious errors during partial updates.
     const updatedProfile = await VendorProfile.findOneAndUpdate(
       { vendorId: userId },
-      vendorUpdates,
-      { new: true, runValidators: true }
+      { $set: vendorUpdates },
+      { new: true }
     );
+
+    if (!updatedProfile) {
+      return res.status(404).json({ message: 'Vendor profile not found. Cannot save settings.' });
+    }
+
+    // 🔧 BUG FIX: Propagate the holiday toggle to all active subscriptions.
+    // Previously the toggle was saved on VendorProfile but existing active
+    // subscriptions kept their old vendorConsidersHolidays value, so the
+    // student holiday-skip logic was reading stale data.
+    if (parsedHolidayToggle !== undefined) {
+      await Subscription.updateMany(
+        { vendor: updatedProfile._id, status: { $in: ['active', 'paused'] } },
+        { $set: { vendorConsidersHolidays: parsedHolidayToggle } }
+      );
+    }
 
     res.status(200).json({ message: 'Profile updated successfully!', profile: updatedProfile });
 
@@ -721,6 +964,7 @@ exports.updateVendorProfileSettings = async (req, res) => {
     res.status(500).json({ message: 'Server error updating profile' });
   }
 };
+
 
 // --- Get Payment Status (Unpaid vs Paid) ---
 exports.getPaymentRecords = async (req, res) => {
@@ -760,7 +1004,7 @@ exports.getPaymentRecords = async (req, res) => {
       const customerData = {
         id: sub._id,
         name: sub.customer.name,
-        amount: sub.price,
+        amount: sub.totalBill || sub.price || 0,
         hostel: sub.customer.location || 'N/A',
         room: sub.customer.roomNumber || '',
         phone: sub.customer.phone || '',
@@ -1260,18 +1504,25 @@ exports.getVendorHolidays = async (req, res) => {
 // DELETE /api/vendor/holidays/:id
 exports.deleteVendorHoliday = async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id || req.params.holidayId;
     const holiday = await VendorHoliday.findById(id);
     
     if (!holiday) return res.status(404).json({ message: 'Holiday not found' });
 
-    // 🚨 ENTERPRISE SAFETY CHECK: Prevent deleting past holidays
-    const holidayDate = new Date(holiday.dateKey);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0); // Reset time to midnight for accurate day comparison
+    // 🚨 ENTERPRISE SAFETY CHECK: Prevent deleting past or ongoing (today's) holidays
+    // Once a closure day has started (today or in the past), it cannot be cancelled or reversed.
+    const [hYear, hMonth, hDay] = holiday.dateKey.split('-').map(Number);
+    const holidayMidnight = new Date(Date.UTC(hYear, hMonth - 1, hDay));
 
-    if (holidayDate < today) {
-      return res.status(400).json({ message: 'You cannot delete a holiday from the past.' });
+    const today = new Date();
+    today.setHours(today.getHours() + 5);
+    today.setMinutes(today.getMinutes() + 30);
+    const todayString = today.toISOString().split('T')[0];
+    const [tYear, tMonth, tDay] = todayString.split('-').map(Number);
+    const todayMidnight = new Date(Date.UTC(tYear, tMonth - 1, tDay));
+
+    if (holidayMidnight <= todayMidnight) {
+      return res.status(400).json({ message: 'Cannot cancel a closure for today or past dates once the day has started.' });
     }
 
     const time = holiday.time; // 'morning', 'afternoon', 'full_day'
@@ -1329,6 +1580,10 @@ exports.addVendorHoliday = async (req, res) => {
       return res.status(400).json({ message: 'Date and time of closure are required.' });
     }
 
+    // Parse the incoming date once, normalized to midnight for boundary comparisons
+    const [hYear, hMonth, hDay] = date.split('-').map(Number);
+    const holidayDate = new Date(hYear, hMonth - 1, hDay, 0, 0, 0, 0).getTime();
+
     // 1. Save the closure to the database
     await VendorHoliday.create({
       vendor: vendorProfile._id, 
@@ -1343,9 +1598,16 @@ exports.addVendorHoliday = async (req, res) => {
       status: 'active' 
     });
 
-    // 3. The New Logic: Check plan type before extending!
+    // 3. The New Logic: Check plan type AND date boundary before extending!
     const savePromises = activeSubs.map(async (sub) => {
       let requiresSave = false;
+
+      // ── BOUNDARY GUARD: only extend plans whose window includes the holiday ──
+      const planStart = new Date(sub.startDate).setHours(0, 0, 0, 0);
+      const planEnd   = new Date(sub.endDate).setHours(23, 59, 59, 999);
+      if (holidayDate < planStart || holidayDate > planEnd) {
+        return; // Holiday falls outside this student's plan window — skip entirely
+      }
 
       // Identify what kind of plan they have
       const isLunchOnly = sub.preferredSession === 'morning';
@@ -1354,17 +1616,18 @@ exports.addVendorHoliday = async (req, res) => {
 
       // SCENARIO 1: Vendor marks ENTIRE DAY
       if (time === 'full_day') {
-        // Extend EVERYONE by 1 day
+        // Extend EVERYONE (within boundary) by 1 day
         sub.endDate = new Date(sub.endDate.getTime() + 24 * 60 * 60 * 1000);
+        sub.vendorExtensionDays = (sub.vendorExtensionDays || 0) + 1;
         requiresSave = true;
       } 
       
       // SCENARIO 2: Vendor marks LUNCH ONLY
       else if (time === 'morning') {
         // ONLY extend if they are a Lunch-Only student!
-        // (Full-plan and Dinner-only students get NO extension)
         if (isLunchOnly) {
           sub.endDate = new Date(sub.endDate.getTime() + 24 * 60 * 60 * 1000);
+          sub.vendorExtensionDays = (sub.vendorExtensionDays || 0) + 1;
           requiresSave = true;
         }
       } 
@@ -1372,9 +1635,9 @@ exports.addVendorHoliday = async (req, res) => {
       // SCENARIO 3: Vendor marks DINNER ONLY
       else if (time === 'afternoon') {
         // ONLY extend if they are a Dinner-Only student!
-        // (Full-plan and Lunch-only students get NO extension)
         if (isDinnerOnly) {
           sub.endDate = new Date(sub.endDate.getTime() + 24 * 60 * 60 * 1000);
+          sub.vendorExtensionDays = (sub.vendorExtensionDays || 0) + 1;
           requiresSave = true;
         }
       }
@@ -1520,8 +1783,9 @@ exports.respondToRequest = async (req, res) => {
       approvalDate.setHours(0, 0, 0, 0);
 
       // Derive duration from vendor's customPlans or planType
-      const existingSub = await Subscription.findById(subscriptionId).select('planType');
+      const existingSub = await Subscription.findById(subscriptionId);
       const planTypeStr = String(existingSub?.planType || '');
+      const preferredSession = existingSub?.preferredSession || 'both';
 
       let durationDays = 30;
       let matchedPlan = null;
@@ -1541,11 +1805,18 @@ exports.respondToRequest = async (req, res) => {
         else if (lower.includes('single')) durationDays = 1;
       }
 
-      const approvalEndDate = new Date(approvalDate);
-      approvalEndDate.setDate(approvalEndDate.getDate() + (durationDays - 1));
+      // Calculate endDate and vendorExtensionDays taking pre-existing vendor closures into account
+      const { endDate: approvalEndDate, vendorExtensionDays } =
+        await calculateSubscriptionDatesWithVendorHolidays(
+          vendorProfile._id,
+          approvalDate,
+          durationDays,
+          preferredSession
+        );
 
       update.startDate = approvalDate;
       update.endDate   = approvalEndDate;
+      update.vendorExtensionDays = vendorExtensionDays;
     } else {
       // Rejected: zero out the bill so no ghost debt appears in Digital Khata
       update.totalBill = 0;
@@ -1587,11 +1858,36 @@ exports.getActiveCustomers = async (req, res) => {
     const vendorProfile = await VendorProfile.findOne({ vendorId: req.user.userId || req.user.id });
     if (!vendorProfile) return res.status(404).json({ message: 'Vendor not found.' });
 
-    // Find ONLY active subscriptions and populate the student details
-    const activeCustomers = await Subscription.find({
+    const today = new Date();
+    // Normalize to IST
+    today.setHours(today.getHours() + 5);
+    today.setMinutes(today.getMinutes() + 30);
+    const todayString = today.toISOString().split('T')[0];
+    const todayStart = new Date(todayString);
+    todayStart.setHours(0, 0, 0, 0);
+
+    // Find subscriptions that are currently active or paused and have not expired
+    const subscriptions = await Subscription.find({
       vendor: vendorProfile._id,
-      status: 'active'
+      planType: { $ne: 'single' }, // Exclude trial tiffins from the customer directory
+      status: { $in: ['active', 'paused'] },
+      $or: [
+        { endDate: { $gte: todayStart } },
+        { endDate: { $exists: false } },
+        { endDate: null }
+      ]
     }).populate('customer', 'name phone location roomNumber email');
+
+    // Strict filter: ensure plan has not expired by endDate
+    const activeCustomers = subscriptions.filter(sub => {
+      if (!sub.customer) return false;
+      if (sub.endDate) {
+        const end = new Date(sub.endDate);
+        end.setHours(23, 59, 59, 999);
+        if (end < todayStart) return false;
+      }
+      return true;
+    });
 
     res.status(200).json(activeCustomers);
   } catch (error) {
@@ -1729,6 +2025,19 @@ exports.getTodaysDeliveries = async (req, res) => {
     const todayStart = new Date(todayString);
     todayStart.setHours(0, 0, 0, 0);
 
+    // Check if the vendor has marked a holiday for today
+    const todayVendorHoliday = await VendorHoliday.findOne({
+      vendor: vendorProfile._id,
+      dateKey: todayString,
+    }).lean();
+
+    const isMorningVendorHoliday = Boolean(
+      todayVendorHoliday && (todayVendorHoliday.time === 'morning' || todayVendorHoliday.time === 'full_day')
+    );
+    const isAfternoonVendorHoliday = Boolean(
+      todayVendorHoliday && (todayVendorHoliday.time === 'afternoon' || todayVendorHoliday.time === 'full_day')
+    );
+
     // 1. Fetch active students whose endDate has not passed yet
     const activeSubscriptions = await Subscription.find({
       vendor: vendorProfile._id,
@@ -1850,8 +2159,8 @@ exports.getTodaysDeliveries = async (req, res) => {
         allowedSessions = [sub.preferredSession || 'morning'];
       }
 
-      // 12:30 PM (LUNCH) SORTING — use morning poll vote for mealType
-      if (allowedSessions.includes('morning') && skippedTime !== 'morning' && skippedTime !== 'full_day') {
+      // 12:30 PM (LUNCH) SORTING — only active if today is NOT a morning/full-day vendor closure
+      if (!isMorningVendorHoliday && allowedSessions.includes('morning') && skippedTime !== 'morning' && skippedTime !== 'full_day') {
         const morningStudentData = { ...baseStudentData, mealType: morningMealType, mealSlot: 'morning' };
         if (deliveredMorningIds.has(subId)) {
           morningDelivered.push(morningStudentData);
@@ -1860,8 +2169,8 @@ exports.getTodaysDeliveries = async (req, res) => {
         }
       }
 
-      // 8:00 PM (DINNER) SORTING — use afternoon poll vote for mealType
-      if (allowedSessions.includes('afternoon') && skippedTime !== 'afternoon' && skippedTime !== 'full_day') {
+      // 8:00 PM (DINNER) SORTING — only active if today is NOT an afternoon/full-day vendor closure
+      if (!isAfternoonVendorHoliday && allowedSessions.includes('afternoon') && skippedTime !== 'afternoon' && skippedTime !== 'full_day') {
         const afternoonStudentData = { ...baseStudentData, mealType: afternoonMealType, mealSlot: 'afternoon' };
         if (deliveredAfternoonIds.has(subId)) {
           afternoonDelivered.push(afternoonStudentData);
@@ -1890,16 +2199,22 @@ exports.getTodaysDeliveries = async (req, res) => {
         status: 'accepted',
       }).populate('customer', 'name phone location roomNumber');
 
-      extraOrders = todayTrials.map((t) => ({
-        trialOrderId: t._id,
-        customerName: t.customer?.name || 'Unknown',
-        phone: t.customer?.phone || '',
-        location: t.customer?.location || 'N/A',
-        roomNumber: t.customer?.roomNumber || '',
-        targetSession: t.targetSession,
-        price: t.price,
-        isTrial: true,
-      }));
+      extraOrders = todayTrials
+        .filter((t) => {
+          if (t.targetSession === 'morning' && isMorningVendorHoliday) return false;
+          if (t.targetSession === 'afternoon' && isAfternoonVendorHoliday) return false;
+          return true;
+        })
+        .map((t) => ({
+          trialOrderId: t._id,
+          customerName: t.customer?.name || 'Unknown',
+          phone: t.customer?.phone || '',
+          location: t.customer?.location || 'N/A',
+          roomNumber: t.customer?.roomNumber || '',
+          targetSession: t.targetSession,
+          price: t.price,
+          isTrial: true,
+        }));
     } catch (trialErr) {
       console.error('Trial order fetch error (non-fatal):', trialErr);
     }
@@ -1912,19 +2227,24 @@ exports.getTodaysDeliveries = async (req, res) => {
       sessions: {
         morning: {
           totalDeliveries: morningPending.length,
-          groupedList: groupStudentsByLocation(morningPending)
+          groupedList: groupStudentsByLocation(morningPending),
+          isClosed: isMorningVendorHoliday,
         },
         afternoon: {
           totalDeliveries: afternoonPending.length,
-          groupedList: groupStudentsByLocation(afternoonPending)
+          groupedList: groupStudentsByLocation(afternoonPending),
+          isClosed: isAfternoonVendorHoliday,
         }
       },
       deliveredSessions: {
         morning: { totalDeliveries: morningDelivered.length, groupedList: groupStudentsByLocation(morningDelivered) },
         afternoon: { totalDeliveries: afternoonDelivered.length, groupedList: groupStudentsByLocation(afternoonDelivered) }
       },
-      isVendorHoliday: false,
-      holidayReason: '',
+      isVendorHoliday: !!todayVendorHoliday,
+      holidayReason: todayVendorHoliday ? (todayVendorHoliday.reason || 'Kitchen Closure') : '',
+      holidaySession: todayVendorHoliday ? (todayVendorHoliday.time || 'full_day') : null,
+      isMorningHoliday: isMorningVendorHoliday,
+      isAfternoonHoliday: isAfternoonVendorHoliday,
       extraOrders
     });
 
@@ -1933,6 +2253,83 @@ exports.getTodaysDeliveries = async (req, res) => {
     res.status(500).json({ message: 'Server error fetching deliveries.' });
   }
 };
+
+// ─── Notify Location Arrival ──────────────────────────────────────────────────
+// POST /api/vendor/deliveries/notify-location
+// Sends a push notification to all active students at a specific hostel/location
+// for this vendor, informing them the delivery partner has arrived.
+exports.notifyLocationArrival = async (req, res) => {
+  try {
+    const { location } = req.body;
+    if (!location || !location.trim()) {
+      return res.status(400).json({ message: 'Location is required.' });
+    }
+
+    const vendorProfile = await VendorProfile.findOne({
+      vendorId: req.user.userId || req.user.id,
+    }).lean();
+    if (!vendorProfile) {
+      return res.status(404).json({ message: 'Vendor not found.' });
+    }
+
+    // IST today string for active subscription filter
+    const today = new Date();
+    today.setHours(today.getHours() + 5);
+    today.setMinutes(today.getMinutes() + 30);
+    const todayString = today.toISOString().split('T')[0];
+    const todayStart = new Date(todayString);
+    todayStart.setHours(0, 0, 0, 0);
+
+    // Find all active subscriptions for this vendor whose customer lives at the given location
+    const activeSubs = await Subscription.find({
+      vendor: vendorProfile._id,
+      status: 'active',
+      endDate: { $gte: todayStart },
+    })
+      .populate('customer', 'name fcmToken location')
+      .lean();
+
+    // Filter to only students at this exact location who have an FCM token
+    const tokens = [];
+    for (const sub of activeSubs) {
+      const customer = sub.customer;
+      if (!customer) continue;
+      if ((customer.location || '').trim().toLowerCase() !== location.trim().toLowerCase()) continue;
+      if (customer.fcmToken) tokens.push(customer.fcmToken);
+    }
+
+    if (tokens.length === 0) {
+      return res.status(200).json({
+        message: `No registered devices found for students at ${location}.`,
+        notified: 0,
+      });
+    }
+
+    // Send multicast push notification via Firebase Admin SDK
+    const admin = require('firebase-admin');
+    const notificationTitle = 'Your tiffin is here! 🍱';
+    const notificationBody = `The delivery partner has arrived at ${location}. Please come down and collect your meal.`;
+
+    const multicastMessage = {
+      notification: { title: notificationTitle, body: notificationBody },
+      android: { priority: 'high', notification: { sound: 'default' } },
+      tokens,
+    };
+
+    const fcmResponse = await admin.messaging().sendEachForMulticast(multicastMessage);
+    console.log(`✅ notifyLocationArrival: sent to ${fcmResponse.successCount}/${tokens.length} devices at "${location}"`);
+
+    return res.status(200).json({
+      message: `Notifications sent to ${fcmResponse.successCount} student(s) at ${location}.`,
+      notified: fcmResponse.successCount,
+      failed: fcmResponse.failureCount,
+    });
+  } catch (error) {
+    console.error('notifyLocationArrival error:', error);
+    return res.status(500).json({ message: 'Server error sending notifications.' });
+  }
+};
+
 exports.extendPaymentDeadline = async (req, res) => {
   try {
     const { subscriptionId } = req.params;
@@ -2032,10 +2429,14 @@ exports.getFullProfile = async (req, res) => {
       profile = await VendorProfile.create({ vendorId: userId, businessName: user.name + "'s Kitchen", phone: user.phone || '' });
     }
 
-    // 🚨 THE FIX: Search for reviews attached to EITHER the User ID OR the Profile ID!
+    const vendorIds = [profile._id, profile.vendorId, userId].filter(Boolean);
     const reviews = await Review.find({ 
-      $or: [{ vendorId: userId }, { vendorId: profile._id }] 
+      $or: [
+        { vendor: { $in: vendorIds } },
+        { vendorId: { $in: vendorIds } }
+      ] 
     })
+      .populate('customer', 'name location roomNumber')
       .populate('customerId', 'name location roomNumber')
       .sort({ createdAt: -1 });
 
@@ -2071,6 +2472,7 @@ exports.recordPayment = async (req, res) => {
     const activeBills = await Subscription.find({
       vendor: vendorProfile._id,
       customer: customerId,
+      status: { $nin: ['pending', 'rejected'] }, // 🚨 THE FIX: Ignore unapproved plans
       paymentStatus: { $in: ['unpaid', 'partial'] }
     }).sort({ startDate: 1, createdAt: 1 });
 
@@ -2140,6 +2542,31 @@ exports.recordPayment = async (req, res) => {
         date: new Date()
       });
       createdTransactions.push(txn);
+    }
+
+    // 3. 🔔 Send push notification to the customer
+    try {
+      const customerUser = await User.findById(customerId).select('fcmToken name');
+      if (customerUser?.fcmToken) {
+        // Build a summary of which plans were paid in this transaction
+        const planSummaryParts = createdTransactions
+          .filter(t => t.planType && t.planType !== 'UNASSIGNED')
+          .map(t => `${t.planType} (₹${t.amount})`);
+
+        const notifBody = planSummaryParts.length > 0
+          ? `₹${paymentAmount} received by ${vendorName} for: ${planSummaryParts.join(', ')}.`
+          : `₹${paymentAmount} payment has been recorded by ${vendorName}.`;
+
+        await sendPushNotification(
+          customerUser.fcmToken,
+          '💰 Payment Received',
+          notifBody
+        );
+        console.log(`✅ Payment notification sent to customer: ${customerId}`);
+      }
+    } catch (notifError) {
+      // Notification failure should never block the payment response
+      console.error('⚠️ Failed to send payment notification:', notifError);
     }
 
     res.status(200).json({
@@ -2453,12 +2880,17 @@ exports.getPollVoters = async (req, res) => {
       return res.status(400).json({ message: 'Not a poll type that supports voters.' });
     }
 
-    const option = announcement.options[optionIndex];
-    if (!option) {
+    const idx = parseInt(optionIndex, 10);
+    if (isNaN(idx) || idx < 0 || !announcement.options[idx]) {
       return res.status(404).json({ message: 'Option not found.' });
     }
 
-    res.status(200).json(option.voters);
+    const option = announcement.options[idx];
+
+    res.status(200).json({
+      voters: option.voters || [],
+      optionText: option.text || ''
+    });
   } catch (error) {
     console.error('Error fetching poll voters:', error);
     res.status(500).json({ message: 'Server error fetching voters.' });
@@ -2488,6 +2920,42 @@ exports.getTrialOrders = async (req, res) => {
   }
 };
 
+// Helper to sync an accepted TrialOrder into an active Subscription for Digital Khata
+const syncAcceptedTrialOrder = async (trial) => {
+  if (!trial || trial.status !== 'accepted') return;
+
+  const targetDateStr = trial.targetDate;
+  const [tYear, tMonth, tDay] = targetDateStr.split('-').map(Number);
+  const trialStartDate = new Date(tYear, tMonth - 1, tDay, 0, 0, 0, 0);
+  const trialEndDate = new Date(tYear, tMonth - 1, tDay, 23, 59, 59, 999);
+
+  const existingSub = await Subscription.findOne({
+    customer: trial.customer,
+    vendor: trial.vendor,
+    planType: 'Trial Tiffin',
+    startDate: {
+      $gte: trialStartDate,
+      $lte: trialEndDate
+    }
+  });
+
+  if (!existingSub) {
+    await Subscription.create({
+      customer: trial.customer,
+      vendor: trial.vendor,
+      planType: 'Trial Tiffin',
+      mealType: trial.targetSession === 'morning' ? 'Lunch' : 'Dinner',
+      preferredSession: trial.targetSession,
+      startDate: trialStartDate,
+      endDate: trialEndDate,
+      totalBill: trial.price || 0,
+      amountPaid: 0,
+      paymentStatus: 'unpaid',
+      status: 'active',
+    });
+  }
+};
+
 // PUT /vendor/trials/:id/respond — accept or decline a trial order
 exports.respondToTrialOrder = async (req, res) => {
   try {
@@ -2506,6 +2974,10 @@ exports.respondToTrialOrder = async (req, res) => {
 
     trial.status = action === 'accept' ? 'accepted' : 'declined';
     await trial.save();
+
+    if (action === 'accept') {
+      await syncAcceptedTrialOrder(trial);
+    }
 
     // Fire a push notification to the student (best-effort)
     try {
@@ -2526,5 +2998,109 @@ exports.respondToTrialOrder = async (req, res) => {
   } catch (error) {
     console.error('Error responding to trial order:', error);
     res.status(500).json({ message: 'Server error responding to trial order.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /vendor/subscriptions/:id/pause
+// Sets the plan to 'paused', records pausedAt timestamp.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.pauseSubscription = async (req, res) => {
+  try {
+    const vendorProfile = await VendorProfile.findOne({ vendorId: req.user.userId || req.user.id });
+    if (!vendorProfile) return res.status(404).json({ message: 'Vendor not found.' });
+
+    const sub = await Subscription.findOne({ _id: req.params.id, vendor: vendorProfile._id });
+    if (!sub) return res.status(404).json({ message: 'Subscription not found.' });
+
+    if (sub.status !== 'active') {
+      return res.status(400).json({ message: `Cannot pause a plan that is '${sub.status}'.` });
+    }
+
+    sub.status   = 'paused';
+    sub.pausedAt = new Date();
+    await sub.save();
+
+    // Best-effort push notification to student
+    try {
+      const studentUser = await User.findById(sub.customer, 'fcmToken name').lean();
+      if (studentUser?.fcmToken) {
+        await sendPushNotification(
+          studentUser.fcmToken,
+          '🚫 Plan Paused',
+          `${vendorProfile.businessName} has paused your tiffin plan. Deliveries are suspended until the vendor resumes.`,
+        );
+      }
+    } catch (_) {}
+
+    res.status(200).json({ message: 'Plan paused. Deliveries suspended.', subscription: sub });
+  } catch (error) {
+    console.error('pauseSubscription error:', error);
+    res.status(500).json({ message: 'Server error pausing subscription.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /vendor/subscriptions/:id/resume
+// Resumes a paused plan. Calculates paused duration, extends endDate, and
+// records the pause window in pausedPeriods[].
+// ─────────────────────────────────────────────────────────────────────────────
+exports.resumeSubscription = async (req, res) => {
+  try {
+    const vendorProfile = await VendorProfile.findOne({ vendorId: req.user.userId || req.user.id });
+    if (!vendorProfile) return res.status(404).json({ message: 'Vendor not found.' });
+
+    const sub = await Subscription.findOne({ _id: req.params.id, vendor: vendorProfile._id });
+    if (!sub) return res.status(404).json({ message: 'Subscription not found.' });
+
+    if (sub.status !== 'paused') {
+      return res.status(400).json({ message: `Cannot resume a plan that is '${sub.status}'.` });
+    }
+
+    const pausedAt  = new Date(sub.pausedAt);
+    const resumedAt = new Date();
+
+    // How many calendar days was the plan paused?
+    const pausedMs   = resumedAt.getTime() - pausedAt.getTime();
+    const pausedDays = Math.ceil(pausedMs / ONE_DAY_MS);
+
+    // Record the completed pause window
+    sub.pausedPeriods = sub.pausedPeriods || [];
+    sub.pausedPeriods.push({ pausedOn: pausedAt, resumedOn: resumedAt });
+
+    // Extend the plan end date by the paused duration
+    const currentEnd = new Date(sub.endDate || resumedAt);
+    currentEnd.setDate(currentEnd.getDate() + pausedDays);
+    sub.endDate = currentEnd;
+
+    // Clear pause state
+    sub.status   = 'active';
+    sub.pausedAt = null;
+    await sub.save();
+
+    // Best-effort push notification to student
+    try {
+      const studentUser = await User.findById(sub.customer, 'fcmToken name').lean();
+      if (studentUser?.fcmToken) {
+        const newEndFormatted = currentEnd.toLocaleDateString('en-IN', {
+          day: 'numeric', month: 'short', year: 'numeric', timeZone: IST_TIME_ZONE
+        });
+        await sendPushNotification(
+          studentUser.fcmToken,
+          '✅ Plan Resumed',
+          `${vendorProfile.businessName} has resumed your tiffin plan. Your new plan end date is ${newEndFormatted}.`,
+        );
+      }
+    } catch (_) {}
+
+    res.status(200).json({
+      message: `Plan resumed. ${pausedDays} day${pausedDays === 1 ? '' : 's'} added to your plan end date.`,
+      extendedDays: pausedDays,
+      newEndDate: sub.endDate,
+      subscription: sub,
+    });
+  } catch (error) {
+    console.error('resumeSubscription error:', error);
+    res.status(500).json({ message: 'Server error resuming subscription.' });
   }
 };

@@ -83,11 +83,61 @@ exports.getAdminDashboard = async (req, res) => {
 };
 exports.getAllVendors = async (req, res) => {
   try {
-    // Ensure you are NOT selecting just a few fields. 
-    // Fetch the full document to include ownerName, serviceArea, etc.
-    const vendors = await VendorProfile.find({ status: 'approved' }); 
-    res.status(200).json(vendors);
+    // 1. Fetch all approved vendors with full registration details.
+    //    Populate `vendorId` to get the linked User's email address,
+    //    which lives on the User model, not VendorProfile.
+    const vendors = await VendorProfile.find({ status: 'approved' })
+      .select(
+        'vendorId ownerName businessName phone serviceArea foodType ' +
+        'serviceType deliveryType customPlans trialPrice status approvalDate ' +
+        'rating totalReviews createdAt updatedAt'
+      )
+      .populate({ path: 'vendorId', select: 'email phone name' })
+      .lean(); // Return plain JS objects so we can freely attach new properties
+
+    // 2. Aggregate active/paused subscription counts, broken down by
+    //    vendor and planType — one DB round-trip covers all vendors.
+    const subStats = await Subscription.aggregate([
+      { $match: { status: { $in: ['active', 'paused'] } } },
+      {
+        $group: {
+          _id: { vendor: '$vendor', planType: '$planType' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    // 3. Map billing stats onto each vendor document.
+    const enrichedVendors = vendors.map((vendor) => {
+      // Filter aggregation results to only this vendor's rows
+      const vendorStats = subStats.filter(
+        (s) => s._id.vendor.toString() === vendor._id.toString()
+      );
+
+      // Sum all counts for a single totalActiveCustomers figure
+      const totalActiveCustomers = vendorStats.reduce(
+        (sum, s) => sum + s.count,
+        0
+      );
+
+      // Build a readable plan breakdown array
+      const planBreakdown = vendorStats.map((s) => ({
+        planName: s._id.planType,
+        count: s.count,
+      }));
+
+      return {
+        ...vendor,
+        billingStats: {
+          totalActiveCustomers,
+          planBreakdown,
+        },
+      };
+    });
+
+    res.status(200).json(enrichedVendors);
   } catch (error) {
+    console.error('Error fetching vendors with billing stats:', error);
     res.status(500).json({ message: 'Error fetching vendors' });
   }
 };

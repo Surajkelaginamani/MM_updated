@@ -81,9 +81,9 @@ const runPreExpiryNotifications = async (runLabel) => {
           status:  'active',
           endDate: { $gte: dayStart, $lt: dayEnd },
         })
-        .select('customer vendor endDate')
+        .select('customer vendor endDate planType preferredSession')
         .populate('customer', 'name fcmToken')
-        .populate('vendor',   'businessName')
+        .populate('vendor',   '_id businessName')
         .lean();
     } catch (dbErr) {
       console.error(`${runLabel} [PreExpiry-${daysLeft}d] DB query failed:`, dbErr.message);
@@ -95,29 +95,57 @@ const runPreExpiryNotifications = async (runLabel) => {
       continue;
     }
 
-    console.log(`${runLabel} [PreExpiry-${daysLeft}d] Notifying ${subs.length} student(s).`);
+    // ── Renewal-already-queued dedup ─────────────────────────────────────────
+    // For each expiring sub, check whether an upcoming subscription already
+    // exists for the same vendor + planType + preferredSession combination.
+    // If so, the student has already self-renewed — skip the notification so
+    // they are not spammed.
+    let queuedSubs;
+    try {
+      queuedSubs = await Subscription
+        .find({ status: 'upcoming' })
+        .select('customer vendor planType preferredSession')
+        .lean();
+    } catch (dbErr) {
+      console.error(`${runLabel} [PreExpiry-${daysLeft}d] Queued subs query failed — proceeding without dedup:`, dbErr.message);
+      queuedSubs = [];
+    }
+
+    const alreadyRenewed = (sub) => queuedSubs.some(
+      (q) =>
+        q.customer?.toString() === sub.customer?._id?.toString() &&
+        q.vendor?.toString()   === sub.vendor?._id?.toString()   &&
+        q.planType             === sub.planType                   &&
+        q.preferredSession     === sub.preferredSession
+    );
+    // ────────────────────────────────────────────────────────────────────────
+
+    console.log(`${runLabel} [PreExpiry-${daysLeft}d] Processing ${subs.length} expiring subscription(s).`);
 
     await Promise.all(subs.map(async (sub) => {
       const token   = sub.customer?.fcmToken;
-      const student = sub.customer?.name        || 'Student';
-      const kitchen = sub.vendor?.businessName  || 'your kitchen';
+      const student = sub.customer?.name       || 'Student';
+      const kitchen = sub.vendor?.businessName || 'your kitchen';
 
       if (!token) return; // no device token — safe skip
 
-      const dayWord = daysLeft === 1 ? 'day' : 'days';
+      // Skip if the student has already queued a renewal for this exact plan
+      if (alreadyRenewed(sub)) {
+        console.log(`${runLabel} [PreExpiry-${daysLeft}d] ⏭️  ${student} already renewed — skipping.`);
+        return;
+      }
 
-      // NOTE: The Subscription schema has no `autoRenew` field yet.
-      // When auto-renewal is added to the schema, enable the branch below.
-      // const autoRenew = sub.autoRenew === true;
-      const autoRenew = false; // placeholder — update when schema field is added
-
+      // Progressive message copy per urgency tier
       let title, body;
-      if (autoRenew && daysLeft === 3) {
-        title = '🔄 Plan Auto-Renewing Soon';
-        body  = `Your ${kitchen} plan auto-renews in 3 days! Make sure your dues are clear.`;
+      if (daysLeft === 3) {
+        title = '⏰ 3 Days Left!';
+        body  = `Your plan with ${kitchen} expires soon. Open the app to renew.`;
+      } else if (daysLeft === 2) {
+        title = '⚠️ 2 Days Left!';
+        body  = `Don't miss your meals. Renew your plan with ${kitchen} today.`;
       } else {
-        title = `⏳ Plan Ending in ${daysLeft} ${dayWord}`;
-        body  = `Your ${kitchen} tiffin plan ends in ${daysLeft} ${dayWord}. Clear any dues to avoid interruption!`;
+        title = '🚨 Last Day!';
+        body  = `Your plan with ${kitchen} ends today. Renew now to keep your tiffins coming!`;
       }
 
       try {

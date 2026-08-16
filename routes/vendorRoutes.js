@@ -14,25 +14,26 @@ router.get('/dashboard', verifyToken, vendorController.getVendorDashboard);
 router.get('/profile', verifyToken, vendorController.getVendorProfileSettings);
 router.put('/profile', verifyToken, vendorController.updateVendorProfileSettings);
 
-// --- Students & Requests ---
+// --- Students, Subscriptions & Requests ---
 router.get('/students', verifyToken, vendorController.getVendorStudents);
 router.post('/requests/:subscriptionId/reject', verifyToken, vendorController.rejectSubscriptionRequest);
-// router.put('/requests/status', ...) — REMOVED (dead code).
-// The live approval/rejection path is POST /vendor/subscriptions/respond
-// (respondToRequest), which validates vendor ownership, sets startDate+endDate
-// on approval, and fires push notifications. Do not re-add this route.
 
+// IMPORTANT: Specific /subscriptions/* subpaths must be registered BEFORE parameterized /subscriptions/:id
+router.get('/subscriptions/pending', verifyToken, vendorController.getPendingRequests);
+router.post('/subscriptions/respond', verifyToken, vendorController.respondToRequest);
 router.get('/subscriptions', verifyToken, vendorController.getVendorSubscriptions);
+router.get('/subscriptions/:id', verifyToken, vendorController.getVendorSubscriptionById);
 
 // --- Menu & Announcements ---
 router.get('/communication', verifyToken, vendorController.getCommunicationData);
 router.put('/menu', verifyToken, vendorController.updateWeeklyMenu);
 router.post('/announcements', verifyToken, vendorController.postAnnouncement);
+router.post('/menu/today', verifyToken, vendorController.updateDailyMenu);
+router.delete('/menu/today', verifyToken, vendorController.deleteDailyMenu);
 
 // --- Deliveries ---
-// Change it to this:
 router.get('/deliveries/today', verifyToken, vendorController.getTodaysDeliveries);
-// Inside routes/vendorRoutes.js
+router.post('/deliveries/notify-location', verifyToken, vendorController.notifyLocationArrival);
 router.post('/deliveries/complete/:subscriptionId', vendorController.markDeliveryComplete);
 router.post('/deliveries/reset', verifyToken, vendorController.resetVendorDailyDeliveries);
 router.post('/deliveries/trigger', verifyToken, vendorController.triggerDeliveryUpdate);
@@ -44,7 +45,7 @@ router.post('/payments/:subscriptionId/pay', verifyToken, vendorController.markA
 // --- Holidays ---
 router.get('/holidays', verifyToken, vendorController.getVendorHolidays);
 router.post('/holidays', verifyToken, vendorController.addVendorHoliday);
-router.delete('/holidays/:holidayId', verifyToken, vendorController.deleteVendorHoliday);
+router.delete('/holidays/:id', verifyToken, vendorController.deleteVendorHoliday);
 
 // --- Homemade Store (Inventory & Orders) ---
 router.get('/homemade/items', verifyToken, vendorController.getVendorHomemadeItems);
@@ -56,35 +57,29 @@ router.get('/homemade/orders', verifyToken, vendorController.getVendorHomemadeOr
 router.put('/homemade/orders/:orderId/status', verifyToken, vendorController.updateVendorHomemadeOrderStatus);
 router.get('/homemade/logs', verifyToken, vendorController.getVendorHomemadeStockLogs);
 
-router.get('/subscriptions/pending', verifyToken, vendorController.getPendingRequests);
-router.post('/subscriptions/respond', verifyToken, vendorController.respondToRequest);
-router.post('/menu/today', verifyToken, vendorController.updateDailyMenu);
-router.delete('/menu/today', verifyToken, vendorController.deleteDailyMenu);
-// --- Reviews ---
+// --- Reviews & Customers ---
 router.get('/reviews', verifyToken, vendorController.getVendorReviews);
 router.get('/customers/active', verifyToken, vendorController.getActiveCustomers);
 
-
-// Add these to your routes/vendorRoutes.js file
+// --- Subscription Actions ---
 router.put('/subscriptions/:subscriptionId/approve', vendorController.approveSubscription);
 router.put('/subscriptions/:subscriptionId/extend-deadline', vendorController.extendPaymentDeadline);
 
 // --- DIGITAL KHATA (LEDGER) ROUTES ---
 router.get('/ledger', verifyToken, vendorController.getLedger);
 router.put('/subscriptions/:subscriptionId/pay', verifyToken, vendorController.markSubscriptionPaid);
-router.get('/reviews', verifyToken, vendorController.getVendorReviews);
 router.get('/profile/full', verifyToken, vendorController.getFullProfile);
 router.post('/customers/:customerId/pay', verifyToken, vendorController.recordPayment);
 router.get('/customers/:customerId/transactions', verifyToken, vendorController.getCustomerTransactions);
 router.put('/subscriptions/:id/cancel', verifyToken, vendorController.cancelSubscription);
-
-router.get('/holidays', verifyToken, vendorController.getVendorHolidays);
-router.delete('/holidays/:id', verifyToken, vendorController.deleteVendorHoliday);
+router.put('/subscriptions/:id/pause',  verifyToken, vendorController.pauseSubscription);
+router.put('/subscriptions/:id/resume', verifyToken, vendorController.resumeSubscription);
 router.post('/subscriptions/:id/pay', verifyToken,  vendorController.paySubscriptionBill);
-// Add these to your vendorRoutes.js file!
+
+// --- Announcements Management ---
 router.put('/announcements/:id', verifyToken, vendorController.editAnnouncement);
 router.delete('/announcements/:id', verifyToken, vendorController.deleteAnnouncement);
-// 🔒 NEW: Poll Lock & Voter List endpoints
+// 🔒 Poll Lock & Voter List endpoints
 router.put('/announcements/:id/toggle-lock', verifyToken, vendorController.togglePollLock);
 router.get('/announcements/:id/option/:optionIndex/voters', verifyToken, vendorController.getPollVoters);
 
