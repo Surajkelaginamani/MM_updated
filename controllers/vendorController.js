@@ -257,6 +257,41 @@ const objectToMap = (obj) => {
   return map;
 };
 
+// Helper to sync an accepted TrialOrder into an active Subscription for Digital Khata.
+// NOTE: Defined here (before getVendorDashboard) so it can be used both by the
+// dashboard count and by respondToTrialOrder / getVendorSubscriptions.
+const syncAcceptedTrialOrder = async (trial) => {
+  if (!trial || trial.status !== 'accepted') return;
+
+  const targetDateStr = trial.targetDate;
+  const [tYear, tMonth, tDay] = targetDateStr.split('-').map(Number);
+  const trialStartDate = new Date(tYear, tMonth - 1, tDay, 0, 0, 0, 0);
+  const trialEndDate   = new Date(tYear, tMonth - 1, tDay, 23, 59, 59, 999);
+
+  const existingSub = await Subscription.findOne({
+    customer:  trial.customer,
+    vendor:    trial.vendor,
+    planType:  'Trial Tiffin',
+    startDate: { $gte: trialStartDate, $lte: trialEndDate }
+  });
+
+  if (!existingSub) {
+    await Subscription.create({
+      customer:         trial.customer,
+      vendor:           trial.vendor,
+      planType:         'Trial Tiffin',
+      mealType:         trial.targetSession === 'morning' ? 'Lunch' : 'Dinner',
+      preferredSession: trial.targetSession,
+      startDate:        trialStartDate,
+      endDate:          trialEndDate,
+      totalBill:        trial.price || 0,
+      amountPaid:       0,
+      paymentStatus:    'unpaid',
+      status:           'active',
+    });
+  }
+};
+
 // GET /api/vendor/dashboard
 // Fetch dashboard data for a vendor (analytics, pending requests, etc.)
 exports.getVendorDashboard = async (req, res) => {
@@ -281,6 +316,22 @@ exports.getVendorDashboard = async (req, res) => {
       vendor: vendorProfile._id,
       status: 'pending'
     }).populate('customer', 'name phone location roomNumber');
+
+    // 2c. Auto-sync any accepted trial orders into Subscription records so the
+    //     dashboard subscription count is always up-to-date, even before the
+    //     vendor visits the Customer Plans screen for the first time.
+    try {
+      const acceptedTrialsForSync = await TrialOrder.find({
+        vendor: vendorProfile._id,
+        status: 'accepted'
+      });
+      for (const trial of acceptedTrialsForSync) {
+        await syncAcceptedTrialOrder(trial);
+      }
+    } catch (syncErr) {
+      // Non-fatal — log but don't crash the dashboard
+      console.error('Dashboard trial-sync error (non-fatal):', syncErr);
+    }
 
     // 3. Get all active subscriptions for this vendor
     const activeSubscriptions = await Subscription.find({
@@ -819,6 +870,7 @@ exports.postAnnouncement = async (req, res) => {
             u.fcmToken,
             `New Message from ${vendorName} 📢`,
             notifBody,
+            'announcement',
           )
         )
       );
@@ -1659,7 +1711,8 @@ exports.addVendorHoliday = async (req, res) => {
         await sendPushNotification(
           studentUser.fcmToken,
           "Kitchen Holiday Alert 🏖️",
-          `${vendorProfile.businessName} is closed ${mealText} on ${date}. Your plan has been adjusted!`
+          `${vendorProfile.businessName} is closed ${mealText} on ${date}. Your plan has been adjusted!`,
+          'kitchen_holiday',
         );
       }
     }
@@ -1839,7 +1892,8 @@ exports.respondToRequest = async (req, res) => {
         await sendPushNotification(
           studentUser.fcmToken,
           "Plan Approved! 🍱",
-          `${vendorProfile.businessName} has accepted your request. Tap to check your Khata!`
+          `${vendorProfile.businessName} has accepted your request. Tap to check your Khata!`,
+          'plan_approved',
         );
       }
     }
@@ -1965,6 +2019,7 @@ exports.updateDailyMenu = async (req, res) => {
             u.fcmToken,
             "Today's Menu is Live 🍲",
             `Check out what ${vendorName} is cooking today!`,
+            'menu_live',
           )
         )
       );
@@ -2560,7 +2615,8 @@ exports.recordPayment = async (req, res) => {
         await sendPushNotification(
           customerUser.fcmToken,
           '💰 Payment Received',
-          notifBody
+          notifBody,
+          'payment_received',
         );
         console.log(`✅ Payment notification sent to customer: ${customerId}`);
       }
@@ -2920,42 +2976,6 @@ exports.getTrialOrders = async (req, res) => {
   }
 };
 
-// Helper to sync an accepted TrialOrder into an active Subscription for Digital Khata
-const syncAcceptedTrialOrder = async (trial) => {
-  if (!trial || trial.status !== 'accepted') return;
-
-  const targetDateStr = trial.targetDate;
-  const [tYear, tMonth, tDay] = targetDateStr.split('-').map(Number);
-  const trialStartDate = new Date(tYear, tMonth - 1, tDay, 0, 0, 0, 0);
-  const trialEndDate = new Date(tYear, tMonth - 1, tDay, 23, 59, 59, 999);
-
-  const existingSub = await Subscription.findOne({
-    customer: trial.customer,
-    vendor: trial.vendor,
-    planType: 'Trial Tiffin',
-    startDate: {
-      $gte: trialStartDate,
-      $lte: trialEndDate
-    }
-  });
-
-  if (!existingSub) {
-    await Subscription.create({
-      customer: trial.customer,
-      vendor: trial.vendor,
-      planType: 'Trial Tiffin',
-      mealType: trial.targetSession === 'morning' ? 'Lunch' : 'Dinner',
-      preferredSession: trial.targetSession,
-      startDate: trialStartDate,
-      endDate: trialEndDate,
-      totalBill: trial.price || 0,
-      amountPaid: 0,
-      paymentStatus: 'unpaid',
-      status: 'active',
-    });
-  }
-};
-
 // PUT /vendor/trials/:id/respond — accept or decline a trial order
 exports.respondToTrialOrder = async (req, res) => {
   try {
@@ -2988,6 +3008,7 @@ exports.respondToTrialOrder = async (req, res) => {
           studentUser.fcmToken,
           `Trial Tiffin ${statusText}`,
           `${vendorProfile.businessName} has ${action === 'accept' ? 'accepted' : 'declined'} your trial tiffin request.`,
+          'trial_response',
         );
       }
     } catch (notifErr) {
@@ -3029,6 +3050,7 @@ exports.pauseSubscription = async (req, res) => {
           studentUser.fcmToken,
           '🚫 Plan Paused',
           `${vendorProfile.businessName} has paused your tiffin plan. Deliveries are suspended until the vendor resumes.`,
+          'plan_paused',
         );
       }
     } catch (_) {}
@@ -3089,6 +3111,7 @@ exports.resumeSubscription = async (req, res) => {
           studentUser.fcmToken,
           '✅ Plan Resumed',
           `${vendorProfile.businessName} has resumed your tiffin plan. Your new plan end date is ${newEndFormatted}.`,
+          'plan_resumed',
         );
       }
     } catch (_) {}

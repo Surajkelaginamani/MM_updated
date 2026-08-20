@@ -100,7 +100,7 @@ const sendTodayHolidayNotifications = async () => {
           if (!fcmToken) return; // student has no device registered — safe skip
 
           try {
-            await sendPushNotification(fcmToken, title, body);
+            await sendPushNotification(fcmToken, title, body, 'kitchen_holiday');
           } catch (notifyErr) {
             // Log the bad token but continue with others.
             console.warn(

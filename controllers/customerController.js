@@ -927,6 +927,7 @@ exports.createSubscriptionRequest = async (req, res) => {
           vendorUser.fcmToken,
           'New Subscription Request! 🔔',
           `${studentName} wants to join your mess.`,
+          'new_subscription_request',
         );
       }
     } catch (notifErr) {
@@ -2036,6 +2037,7 @@ exports.bookTrial = async (req, res) => {
           vendorUser.fcmToken,
           '🥑 New Trial Tiffin Request',
           `A student wants to try your tiffin on ${targetDate} (${targetSession === 'morning' ? 'Lunch' : 'Dinner'}).`,
+          'new_trial_request',
         );
       }
     } catch (notifErr) {

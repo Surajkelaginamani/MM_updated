@@ -49,11 +49,14 @@ exports.clearFcmToken = async (req, res) => {
 };
 
 // 2. Reusable Helper function to send actual alerts
-exports.sendPushNotification = async (targetFcmToken, title, body) => {
+// `type` is included in the FCM `data` payload so the Flutter app can
+// navigate to the correct screen when the user taps the notification.
+exports.sendPushNotification = async (targetFcmToken, title, body, type = 'general') => {
   if (!targetFcmToken) return; // If user has no device registered, skip safely
 
   const message = {
     notification: { title, body },
+    data: { type },           // ← routing hint read by NotificationRouter in Flutter
     token: targetFcmToken,
     android: {
       priority: 'high',

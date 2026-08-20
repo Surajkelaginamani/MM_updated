@@ -149,7 +149,7 @@ const runPreExpiryNotifications = async (runLabel) => {
       }
 
       try {
-        await sendPushNotification(token, title, body);
+        await sendPushNotification(token, title, body, 'expiry_reminder');
         console.log(`${runLabel} [PreExpiry-${daysLeft}d] ✅ Notified ${student}`);
       } catch (fcmErr) {
         console.warn(`${runLabel} [PreExpiry-${daysLeft}d] ❌ FCM failed for ${student}:`, fcmErr?.message);
@@ -225,7 +225,7 @@ const runOverdueReminders = async (runLabel) => {
     const body  = `You have pending kitchen dues of ₹${outstanding}. Please pay to clear your Digital Khata.`;
 
     try {
-      await sendPushNotification(token, title, body);
+      await sendPushNotification(token, title, body, 'overdue_dues_student');
 
       // Stamp the reminder time so we don't double-notify today
       await Subscription.findByIdAndUpdate(sub._id, { lastReminderSentAt: new Date() });
@@ -313,7 +313,7 @@ const runVendorCollectionAlerts = async (runLabel) => {
     const body  = `${student}'s plan ended yesterday. Collect their pending due of ₹${outstanding}.`;
 
     try {
-      await sendPushNotification(token, title, body);
+      await sendPushNotification(token, title, body, 'overdue_collect_vendor');
       console.log(`${runLabel} [VendorAlert] ✅ Alerted ${vendor} about ${student} — ₹${outstanding}.`);
     } catch (fcmErr) {
       console.warn(`${runLabel} [VendorAlert] ❌ FCM failed for vendor ${vendor}:`, fcmErr?.message);
